@@ -105,6 +105,51 @@ def _service_index_key(item: Dict[str, Any]) -> Tuple[str, str, str] | None:
     return stype, dom, str(item.get("serviceDeviceType") or "")
 
 
+def _dict_layer(value: Any) -> Dict[str, Any]:
+    """Return a payload wrapper only when it is a dict."""
+    return value if isinstance(value, dict) else {}
+
+
+_MISSING = object()
+
+
+def _payload_field(payload: Dict[str, Any], key: str) -> Any:
+    """Read key from the top level, then item, then body.
+
+    Same precedence as the device id extractor. A missing result means none of
+    those layers contained the key.
+    """
+    if key in payload:
+        return payload[key]
+    item = _dict_layer(payload.get("item"))
+    if key in item:
+        return item[key]
+    body = _dict_layer(payload.get("body"))
+    if key in body:
+        return body[key]
+    return _MISSING
+
+
+def _service_device_type_for_index(item: Dict[str, Any], cached_state: Any) -> str:
+    """Event component, or the cached component when this update omits it."""
+    incoming = item.get("serviceDeviceType") if isinstance(item, dict) else None
+    if incoming:
+        return str(incoming)
+    if isinstance(cached_state, dict) and cached_state.get("serviceDeviceType"):
+        return str(cached_state["serviceDeviceType"])
+    return ""
+
+
+def _cached_service_state(store: Dict[str, Any], device_id: str | None, service_id: str) -> Dict[str, Any]:
+    """Service state already in the live store, if any."""
+    if not device_id:
+        return {}
+    dev = (store or {}).get(device_id) or {}
+    services = (dev.get("snapshot") or {}).get("services") or {}
+    state = services.get(service_id) or {}
+    return state if isinstance(state, dict) else {}
+
+
 def _service_tuples_from_container(container: Any) -> set[Tuple[str, str, str]]:
     """Collect service tuples from a list or nested service payload."""
     items: List[Dict[str, Any]] = []
@@ -166,27 +211,38 @@ def _device_event_removes(event: Any) -> bool:
     return token in _DEVICE_REMOVED_EVENTS
 
 
-def _entity_set_changed(store: Dict[str, Any], payload: Dict[str, Any], device_id: str) -> bool:
-    """True when a pubsub#device event changes device ids or service tuples."""
+def _entity_set_changed(
+    device_ids: set[str],
+    service_tuples: set[Tuple[str, str, str, str]],
+    payload: Dict[str, Any],
+    device_id: str,
+) -> bool:
+    """True when a pubsub#device event changes the setup-time device or service set.
+
+    ``device_ids`` and ``service_tuples`` are the sets captured when platforms
+    were built. Later pubsub#service updates must not move that baseline.
+    ``event`` and ``services`` are read from the top level, then ``item``, then
+    ``body``.
+    """
     device_id = str(device_id or "")
     if not device_id:
         return False
 
-    current_devices, current_tuples = _store_entity_sets(store)
-    if _device_event_removes(payload.get("event")):
-        projected_devices = current_devices - {device_id}
-        projected_tuples = {item for item in current_tuples if item[0] != device_id}
+    event = _payload_field(payload, "event")
+    services = _payload_field(payload, "services")
+    if _device_event_removes(None if event is _MISSING else event):
+        projected_devices = set(device_ids) - {device_id}
+        projected_tuples = {item for item in service_tuples if item[0] != device_id}
     else:
-        projected_devices = set(current_devices)
+        projected_devices = set(device_ids)
         projected_devices.add(device_id)
-        kept = {item for item in current_tuples if item[0] != device_id}
-        if "services" in payload:
-            projected_tuples = set(kept)
-            for stype, dom, sdev in _service_tuples_from_container(payload.get("services")):
-                projected_tuples.add((device_id, stype, dom, sdev))
+        if services is _MISSING:
+            projected_tuples = set(service_tuples)
         else:
-            projected_tuples = current_tuples | kept
-    return projected_devices != current_devices or projected_tuples != current_tuples
+            projected_tuples = {item for item in service_tuples if item[0] != device_id}
+            for stype, dom, sdev in _service_tuples_from_container(services):
+                projected_tuples.add((device_id, stype, dom, sdev))
+    return projected_devices != set(device_ids) or projected_tuples != set(service_tuples)
 
 
 # Burst of device-added/updated events should rebuild entities once.
@@ -233,6 +289,9 @@ class SmartHQWebsocket:
         self._recovery_tasks: set[asyncio.Task] = set()
         self._recovery_locks: Dict[str, asyncio.Lock] = {}
         self._reload_handle: asyncio.TimerHandle | None = None
+        # Entity discovery uses this snapshot, not the live store. pubsub#service
+        # can add a service here without creating its entity.
+        self._setup_device_ids, self._setup_service_tuples = _store_entity_sets(self._store)
 
     async def start(self) -> None:
         """Start the WebSocket connection."""
@@ -1619,7 +1678,12 @@ class SmartHQWebsocket:
         # with one debounced reload. Do not add or remove entities in place,
         # and do not treat this payload as a service-state update.
         if kind == "pubsub#device":
-            if did and _entity_set_changed(self._store, payload, str(did)):
+            if did and _entity_set_changed(
+                self._setup_device_ids,
+                self._setup_service_tuples,
+                payload,
+                str(did),
+            ):
                 self._schedule_entry_reload(str(did))
             else:
                 _LOGGER.debug("[ENTITY_SET] pubsub#device left devices and service tuples unchanged")
@@ -1773,11 +1837,14 @@ class SmartHQWebsocket:
                     continue
                 sid, stype, dom, state = tup
                 
-                # Preserve metadata in state (used when sending commands)
+                # Preserve metadata in state (used when sending commands).
+                # An update that omits serviceDeviceType keeps the cached component
+                # so the index does not grow a second empty-component key.
                 state["serviceType"] = stype
                 state["domainType"] = dom
-                sdev = str(item.get("serviceDeviceType") or "")
-                if "serviceDeviceType" in item:
+                cached = _cached_service_state(self._store, did, sid)
+                sdev = _service_device_type_for_index(item, cached)
+                if item.get("serviceDeviceType"):
                     state["serviceDeviceType"] = item["serviceDeviceType"]
                 
                 svc_states[sid] = state
@@ -1791,20 +1858,21 @@ class SmartHQWebsocket:
             tup = _extract_service_tuple(item)
             if tup:
                 sid, stype, dom, state = tup
+                if not did:
+                    did = item.get("deviceId")
                 
-                # Preserve metadata in state
+                # Preserve metadata in state (used when sending commands).
                 state["serviceType"] = stype
                 state["domainType"] = dom
-                sdev = str(item.get("serviceDeviceType") or "")
-                if "serviceDeviceType" in item:
+                cached = _cached_service_state(self._store, did, sid)
+                sdev = _service_device_type_for_index(item, cached)
+                if item.get("serviceDeviceType"):
                     state["serviceDeviceType"] = item["serviceDeviceType"]
                 
                 svc_states[sid] = state
                 if stype and dom:
                     index[(stype, dom, sdev)] = sid
                 changed = True
-                if not did:
-                    did = item.get("deviceId")
 
         # Update store and send signal
         if changed and did:
@@ -1845,8 +1913,13 @@ class SmartHQWebsocket:
                     if service_state.get("serviceType") == POWER_USAGE_SERVICE:
                         service_state["instantaneousPower"] = 0
             
-            # Update index
+            # Update index. Drop any previous key for the same service id so an
+            # omitted serviceDeviceType cannot leave a second empty-component entry.
             cur_index = snap.setdefault("index", {})
+            for key, indexed_sid in index.items():
+                stale = [existing for existing, sid in cur_index.items() if sid == indexed_sid and existing != key]
+                for existing in stale:
+                    cur_index.pop(existing, None)
             cur_index.update(index)
             
             _LOGGER.debug("[SERVICE_UPDATE] %s: %d services updated", did[:8], len(svc_states))

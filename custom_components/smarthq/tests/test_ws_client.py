@@ -874,3 +874,177 @@ async def test_device_set_changes_debounce_to_one_reload() -> None:
     await asyncio.sleep(0)
 
     hass.config_entries.async_reload.assert_awaited_once_with("entry-1")
+
+
+def _service_tuple(service_device_type: str, service_id: str = "svc-1") -> dict:
+    return {
+        "serviceId": service_id,
+        "serviceType": _TOGGLE,
+        "domainType": _LIGHT_DOMAIN,
+        "serviceDeviceType": service_device_type,
+    }
+
+
+async def test_wrapped_device_service_change_schedules_reload() -> None:
+    """item/body wrappers use the same precedence as the device id for reload comparison."""
+    device_id = "device-1"
+    store = _indexed_store(device_id)
+    hass = _reload_hass()
+    websocket = SmartHQWebsocket(
+        hass, api=MagicMock(), device_ids=[device_id], store=store, entry_id="entry-1"
+    )
+
+    await websocket._on_message(
+        {
+            "kind": "pubsub#device",
+            "item": {
+                "deviceId": device_id,
+                "event": "updated",
+                "services": [_service_tuple(_LIGHT_DEVICE)],
+            },
+        }
+    )
+    assert websocket._reload_handle is not None
+    websocket._cancel_entry_reload()
+
+    await websocket._on_message(
+        {
+            "kind": "pubsub#device",
+            "body": {"deviceId": device_id, "event": "deleted"},
+        }
+    )
+    assert websocket._reload_handle is not None
+    websocket._cancel_entry_reload()
+
+    await websocket._on_message(
+        {
+            "kind": "pubsub#device",
+            "event": "updated",
+            "services": [_service_tuple(_SMOKER)],
+            "item": {
+                "deviceId": device_id,
+                "event": "deleted",
+                "services": [_service_tuple(_LIGHT_DEVICE)],
+            },
+        }
+    )
+    assert websocket._reload_handle is None
+    hass.config_entries.async_reload.assert_not_called()
+
+
+async def test_device_event_reloads_after_service_event_inserts_tuple() -> None:
+    """A service insert must not hide the new tuple from the next device event."""
+    device_id = "device-1"
+    store = _indexed_store(device_id)
+    hass = _reload_hass()
+    websocket = SmartHQWebsocket(
+        hass, api=MagicMock(), device_ids=[device_id], store=store, entry_id="entry-1"
+    )
+    service_event = {
+        "kind": "pubsub#service",
+        "deviceId": device_id,
+        "serviceId": "svc-2",
+        "serviceType": _TOGGLE,
+        "domainType": _LIGHT_DOMAIN,
+        "serviceDeviceType": _LIGHT_DEVICE,
+        "state": {"on": True},
+    }
+    device_event = {
+        "kind": "pubsub#device",
+        "deviceId": device_id,
+        "event": "updated",
+        "services": [_service_tuple(_SMOKER), _service_tuple(_LIGHT_DEVICE, "svc-2")],
+    }
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send"):
+        await websocket._on_message(service_event)
+    assert websocket._reload_handle is None
+    assert (_TOGGLE, _LIGHT_DOMAIN, _LIGHT_DEVICE) in {
+        (service.get("serviceType"), service.get("domainType"), service.get("serviceDeviceType"))
+        for service in store[device_id]["snapshot"]["services"].values()
+    }
+
+    await websocket._on_message(device_event)
+
+    assert websocket._reload_handle is not None
+    websocket._cancel_entry_reload()
+    hass.config_entries.async_reload.assert_not_called()
+
+
+_LAUNDRY_STATE = "cloud.smarthq.service.laundry.state.v1"
+_LAUNDRY_DOMAIN = "cloud.smarthq.domain.laundry"
+_WASHER = "cloud.smarthq.device.washer"
+
+
+def _laundry_store(device_id: str = "device-1") -> dict:
+    """Washer whose laundry state index key includes serviceDeviceType."""
+    return {
+        device_id: {
+            "snapshot": {
+                "services": {
+                    "laundry-1": {
+                        "serviceType": _LAUNDRY_STATE,
+                        "domainType": _LAUNDRY_DOMAIN,
+                        "serviceDeviceType": _WASHER,
+                        "runStatus": "cloud.smarthq.type.runstatus.delayed",
+                    }
+                },
+                "index": {(_LAUNDRY_STATE, _LAUNDRY_DOMAIN, _WASHER): "laundry-1"},
+                "raw": {},
+            }
+        }
+    }
+
+
+def _assert_laundry_index_keeps_cached_component(store: dict, device_id: str) -> None:
+    index = store[device_id]["snapshot"]["index"]
+    state = store[device_id]["snapshot"]["services"]["laundry-1"]
+    assert index == {(_LAUNDRY_STATE, _LAUNDRY_DOMAIN, _WASHER): "laundry-1"}
+    assert state["serviceDeviceType"] == _WASHER
+    assert state["runStatus"] == "cloud.smarthq.type.runstatus.running"
+
+
+async def test_service_list_omitting_component_reuses_cached_index_key() -> None:
+    """A services-array update without serviceDeviceType must not add an empty index key."""
+    device_id = "device-1"
+    store = _laundry_store(device_id)
+    websocket = SmartHQWebsocket(MagicMock(), api=MagicMock(), device_ids=[device_id], store=store)
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send"):
+        await websocket._on_message(
+            {
+                "kind": "pubsub#service",
+                "deviceId": device_id,
+                "services": [
+                    {
+                        "serviceId": "laundry-1",
+                        "serviceType": _LAUNDRY_STATE,
+                        "domainType": _LAUNDRY_DOMAIN,
+                        "state": {"runStatus": "cloud.smarthq.type.runstatus.running"},
+                    }
+                ],
+            }
+        )
+
+    _assert_laundry_index_keeps_cached_component(store, device_id)
+
+
+async def test_single_service_omitting_component_reuses_cached_index_key() -> None:
+    """A single service update without serviceDeviceType must not add an empty index key."""
+    device_id = "device-1"
+    store = _laundry_store(device_id)
+    websocket = SmartHQWebsocket(MagicMock(), api=MagicMock(), device_ids=[device_id], store=store)
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send"):
+        await websocket._on_message(
+            {
+                "kind": "pubsub#service",
+                "deviceId": device_id,
+                "serviceId": "laundry-1",
+                "serviceType": _LAUNDRY_STATE,
+                "domainType": _LAUNDRY_DOMAIN,
+                "state": {"runStatus": "cloud.smarthq.type.runstatus.running"},
+            }
+        )
+
+    _assert_laundry_index_keeps_cached_component(store, device_id)
