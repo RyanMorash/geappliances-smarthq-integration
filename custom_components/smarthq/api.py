@@ -27,6 +27,10 @@ class SmartHQError(Exception):
     """API error wrapper."""
 
 
+# POST /v2/command acknowledgement. Any other present outcome is a failure.
+COMMAND_OUTCOME_SUCCESS = "cloud.smarthq.outcome.success"
+
+
 def _is_2xx(status: int) -> bool:
     return 200 <= status < 300
 
@@ -114,7 +118,12 @@ class SmartHQApi:
             command: Command dict with commandType and parameters
         
         Returns:
-            Response dict from the server
+            Response body. correlationId is preserved when the command is accepted.
+
+        Raises:
+            SmartHQError: HTTP failure, or a body that includes outcome and the value
+                is not cloud.smarthq.outcome.success. Null counts as present. Only a
+                missing outcome key is accepted without that check.
         """
         url = f"{self._base_url}/v2/command"
         
@@ -137,11 +146,27 @@ class SmartHQApi:
         
         try:
             result = await self._request_json("POST", url, json=payload)
-            _LOGGER.info("[REST_CMD] ✓ Command successful: %s", result)
-            return result
         except SmartHQError as e:
             _LOGGER.error("[REST_CMD] ✗ Command failed: %s", e)
             raise
+
+        if isinstance(result, dict) and "outcome" in result:
+            outcome = result["outcome"]
+            if outcome != COMMAND_OUTCOME_SUCCESS:
+                correlation_id = result.get("correlationId")
+                message = f"Command outcome {outcome}"
+                if correlation_id:
+                    message = f"{message} (correlationId={correlation_id})"
+                _LOGGER.error("[REST_CMD] ✗ %s", message)
+                raise SmartHQError(message)
+
+        correlation_id = result.get("correlationId") if isinstance(result, dict) else None
+        _LOGGER.info(
+            "[REST_CMD] ✓ Command accepted: correlationId=%s outcome=%s",
+            correlation_id,
+            result.get("outcome") if isinstance(result, dict) else None,
+        )
+        return result
 
     # ---------- List devices ----------
     async def async_list_devices(self) -> List[Dict[str, Any]]:

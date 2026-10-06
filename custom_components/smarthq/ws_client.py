@@ -96,6 +96,18 @@ def _extract_service_tuple(item: Dict[str, Any]) -> Tuple[str, str, str, Dict[st
     return sid, stype, dom, state
 
 
+# pubsub#command summary buckets that mean the appliance did not apply the command.
+_COMMAND_REFETCH_OUTCOMES = frozenset({"failed", "timeout", "unknown"})
+
+
+def _command_outcome_needs_refetch(outcome: Any) -> bool:
+    """True when a command outcome should be followed by a device refetch."""
+    if not isinstance(outcome, str):
+        return False
+    suffix = outcome.strip().lower().rsplit(".", 1)[-1]
+    return suffix in _COMMAND_REFETCH_OUTCOMES
+
+
 class SmartHQWebsocket:
     """SmartHQ WebSocket client."""
 
@@ -110,6 +122,10 @@ class SmartHQWebsocket:
         self._task: Optional[asyncio.Task] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._stopped = asyncio.Event()
+        # Monotonic per device. Command recovery applies only if this is unchanged.
+        self._device_epochs: Dict[str, int] = {}
+        self._recovery_tasks: set[asyncio.Task] = set()
+        self._recovery_locks: Dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         """Start the WebSocket connection."""
@@ -128,6 +144,7 @@ class SmartHQWebsocket:
                 await self._ws.close()
         if self._session:
             await self._session.close()
+        self._cancel_command_recoveries()
 
     async def _runner(self) -> None:
         """Main WebSocket connection loop with reconnection logic."""
@@ -215,6 +232,7 @@ class SmartHQWebsocket:
                 backoff = min(backoff * 2, 60)
             finally:
                 self._ws = None
+                self._cancel_command_recoveries()
                 if session_connected and not self._stopped.is_set():
                     await self._refetch_devices_after_disconnect()
 
@@ -275,24 +293,85 @@ class SmartHQWebsocket:
                 "deviceType": item.get("deviceType"),
             }
 
+    def _advance_device_epoch(self, device_id: str) -> int:
+        """Mark a newer snapshot for this device so older REST recovery is dropped."""
+        epoch = self._device_epochs.get(device_id, 0) + 1
+        self._device_epochs[device_id] = epoch
+        return epoch
+
+    def _schedule_command_recovery(self, device_id: str) -> None:
+        """Refetch one device without blocking the websocket reader."""
+        epoch = self._advance_device_epoch(device_id)
+        task = asyncio.create_task(
+            self._run_command_recovery(device_id, epoch),
+            name=f"smarthq_command_recovery_{device_id[:8]}",
+        )
+        self._recovery_tasks.add(task)
+        task.add_done_callback(self._recovery_task_done)
+
+    def _recovery_task_done(self, task: asyncio.Task) -> None:
+        self._recovery_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error:
+            _LOGGER.debug("Command recovery task failed: %s", error)
+
+    def _cancel_command_recoveries(self) -> None:
+        for task in list(self._recovery_tasks):
+            task.cancel()
+
+    async def _run_command_recovery(self, device_id: str, epoch: int) -> None:
+        """Run one command-failure refetch. A newer epoch for this device wins."""
+        lock = self._recovery_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            if self._device_epochs.get(device_id) != epoch:
+                return
+            await self._refetch_device_snapshot(
+                device_id,
+                failure_log="Command outcome refetch failed for %s: %s",
+                epoch=epoch,
+            )
+
+    async def _refetch_device_snapshot(
+        self,
+        device_id: str,
+        *,
+        failure_log: str,
+        epoch: int | None = None,
+    ) -> None:
+        """Load one device over REST and notify entities. The command event is not state."""
+        if epoch is not None and self._device_epochs.get(device_id) != epoch:
+            return
+        try:
+            item = await self._api.async_get_device_item(device_id)
+        except Exception as err:
+            _LOGGER.debug(
+                failure_log,
+                device_id[:8],
+                _redact_access_token_from_text(str(err)),
+            )
+            return
+        if epoch is not None and self._device_epochs.get(device_id) != epoch:
+            _LOGGER.debug(
+                "Skipping stale command recovery for %s",
+                device_id[:8],
+            )
+            return
+        if not item:
+            return
+        self._write_device_item_to_store(device_id, item)
+        async_dispatcher_send(
+            self.hass,
+            SIGNAL_DEVICE_UPDATED.format(device_id=device_id),
+        )
+
     async def _refetch_devices_after_disconnect(self) -> None:
         """Refresh known device snapshots over REST after the websocket drops."""
         for device_id in list(self._device_ids):
-            try:
-                item = await self._api.async_get_device_item(device_id)
-            except Exception as err:
-                _LOGGER.debug(
-                    "Post-disconnect refetch failed for %s: %s",
-                    device_id[:8],
-                    _redact_access_token_from_text(str(err)),
-                )
-                continue
-            if not item:
-                continue
-            self._write_device_item_to_store(device_id, item)
-            async_dispatcher_send(
-                self.hass,
-                SIGNAL_DEVICE_UPDATED.format(device_id=device_id),
+            await self._refetch_device_snapshot(
+                device_id,
+                failure_log="Post-disconnect refetch failed for %s: %s",
             )
 
     async def _maybe_send_idle_ping(
@@ -613,7 +692,7 @@ class SmartHQWebsocket:
         }
 
         try:
-            # Send via REST API
+            # Send via REST API. Entity state updates only from pubsub#service.
             await self._api.async_send_command(
                 device_id=device_id,
                 service_type=service_type,
@@ -621,17 +700,6 @@ class SmartHQWebsocket:
                 service_device_type=service_device_type,
                 command=command,
             )
-
-            # Optimistic update
-            snap = self._store.get(device_id, {}).get("snapshot", {})
-            services = snap.get("services", {})
-            if service_id in services:
-                services[service_id]["on"] = on
-                _LOGGER.debug(
-                    "[TOGGLE_CMD] Optimistic update: service %s on=%s",
-                    service_id[:8],
-                    on,
-                )
 
             _LOGGER.info("[TOGGLE_CMD] ✓ Command sent successfully")
 
@@ -875,7 +943,7 @@ class SmartHQWebsocket:
         }
         
         try:
-            # Send via REST API
+            # Send via REST API. Entity state updates only from pubsub#service.
             await self._api.async_send_command(
                 device_id=device_id,
                 service_type=service_type,
@@ -883,21 +951,7 @@ class SmartHQWebsocket:
                 service_device_type=service_device_type,
                 command=command,
             )
-            
-            # Optimistic update
-            snap = self._store.get(device_id, {}).get("snapshot", {})
-            services = snap.get("services", {})
-            if service_id in services:
-                services[service_id]["mode"] = mode_token
-                # Update on state based on mode
-                mode_str = str(mode_token).lower()
-                services[service_id]["on"] = mode_str.endswith(".on") or "on" in mode_str
-                _LOGGER.debug(
-                    "[MODE_CMD] Optimistic update: service %s mode=%s",
-                    service_id[:8],
-                    mode_token,
-                )
-            
+
             _LOGGER.info("[MODE_CMD] ✓ Command sent successfully")
             
         except Exception as e:
@@ -1227,36 +1281,6 @@ class SmartHQWebsocket:
             _LOGGER.error("[ACCENT_LIGHT] ✗ Failed: %s", e, exc_info=True)
             raise
 
-    async def async_set_smoke_level(self, device_id: str, service_id: str, level: int) -> None:
-        """Send smoke level command using official format."""
-        _LOGGER.info("[SMOKE_CMD] device=%s service=%s -> level=%s", device_id[:8], service_id[:8], level)        
-        service_meta = self._get_service_metadata(device_id, service_id)
-        service_type = service_meta.get("serviceType", "cloud.smarthq.service.integer")
-        domain_type = service_meta.get("domainType", "")
-        device_type = service_meta.get("deviceType", "")
-        
-        payload = {
-            "kind": "service#command",
-            "deviceId": device_id,
-            "serviceType": service_type,
-            "domainType": domain_type,
-            "serviceDeviceType": device_type,
-            "command": {
-                "commandType": "cloud.smarthq.command.integer.set",
-                "numericOptionValue": level
-            }
-        }
-        
-        try:
-            _LOGGER.info("[SMOKE_CMD] Sending: %s", json.dumps(payload, indent=2))
-            if self._ws and not self._ws.closed:
-                await self._ws.send_json(payload)
-                await asyncio.sleep(0.5)
-                _LOGGER.info("[SMOKE_CMD] ✓ Command sent")
-                return
-        except Exception as e:
-            _LOGGER.error("[SMOKE_CMD] ✗ Exception: %s", e, exc_info=True)
-
     def _get_service_metadata(self, device_id: str, service_id: str) -> Dict[str, Any]:
         """Extract service metadata from store for command construction."""
         dev_data = self._store.get(device_id, {})
@@ -1350,21 +1374,6 @@ class SmartHQWebsocket:
             "domainType": "",
             "serviceDeviceType": info.get("deviceType", ""),
         }
-
-    def _optimistic_toggle_update(self, service_id: str, on: bool) -> None:
-        """Optimistically update toggle state before server confirmation."""
-        for device_id, dev_data in self._store.items():
-            snap = dev_data.get("snapshot") or {}
-            services = snap.get("services") or {}
-            if service_id in services:
-                services[service_id]["on"] = on
-                _LOGGER.debug("[TOGGLE_CMD] Optimistic update: service %s on=%s", service_id[:8], on)
-                # Send dispatcher signal
-                async_dispatcher_send(
-                    self.hass,
-                    SIGNAL_DEVICE_UPDATED.format(device_id=device_id)
-                )
-                break
 
     async def _on_message(self, payload: Dict[str, Any]) -> None:
         """Apply events to store and notify entities."""
@@ -1460,53 +1469,61 @@ class SmartHQWebsocket:
                 self._device_ids.add(did)
                 _LOGGER.debug("Learned new deviceId: %s", did)
 
-        # Handle command outcome (timeout detection)
-        if kind == "pubsub#command" and "outcome" in payload:
+        # pubsub#command is an outcome, not the new service state.
+        # Success still waits for pubsub#service. failed/timeout/unknown refetch REST.
+        if kind == "pubsub#command":
             outcome = payload.get("outcome", "")
             correlation_id = payload.get("correlationId", "N/A")
-            command_type = payload.get("command", {}).get("commandType", "unknown")
+            command_body = payload.get("command") if isinstance(payload.get("command"), dict) else {}
+            command_type = command_body.get("commandType", "unknown")
             service_type = payload.get("serviceType", "")
             domain_type = payload.get("domainType", "")
-            
-            if "timeout" in outcome.lower():
-                # Timeout occurred - log device state
-                _LOGGER.error(
-                    "[COMMAND_TIMEOUT] Command failed after 20s\n"
-                    "  Device: %s\n"
-                    "  Command: %s\n"
-                    "  Service: %s\n"
-                    "  Domain: %s\n"
-                    "  CorrelationId: %s",
-                    did[:8] if did else "N/A",
-                    command_type,
-                    service_type,
-                    domain_type,
-                    correlation_id
-                )
-                
-                # Additional logging of device state info
-                if did:
-                    cooking_state = self._get_cooking_state(did)
-                    presence_info = self._store.get(did, {}).get("presence", {})
-                    presence = presence_info.get("presence", "UNKNOWN")
-                    
+            correlation_label = correlation_id[:8] if isinstance(correlation_id, str) and len(correlation_id) > 8 else correlation_id
+
+            if _command_outcome_needs_refetch(outcome):
+                if isinstance(outcome, str) and "timeout" in outcome.lower():
                     _LOGGER.error(
-                        "[COMMAND_TIMEOUT_STATE] Device state when timeout occurred:\n"
-                        "  Presence: %s\n"
-                        "  RunStatus: %s\n"
-                        "  CookingStatus: %s\n"
-                        "  RemoteEnable: %s\n"
-                        "  → Device may not respond to commands in current state",
-                        presence,
-                        cooking_state.get("runStatus", "N/A"),
-                        cooking_state.get("cookingStatus", "N/A"),
-                        cooking_state.get("remoteEnable", "N/A")
+                        "[COMMAND_TIMEOUT] Command failed after 20s\n"
+                        "  Device: %s\n"
+                        "  Command: %s\n"
+                        "  Service: %s\n"
+                        "  Domain: %s\n"
+                        "  CorrelationId: %s",
+                        did[:8] if did else "N/A",
+                        command_type,
+                        service_type,
+                        domain_type,
+                        correlation_id
                     )
+                    if did:
+                        cooking_state = self._get_cooking_state(did)
+                        presence_info = self._store.get(did, {}).get("presence", {})
+                        presence = presence_info.get("presence", "UNKNOWN")
+                        _LOGGER.error(
+                            "[COMMAND_TIMEOUT_STATE] Device state when timeout occurred:\n"
+                            "  Presence: %s\n"
+                            "  RunStatus: %s\n"
+                            "  CookingStatus: %s\n"
+                            "  RemoteEnable: %s\n"
+                            "  → Device may not respond to commands in current state",
+                            presence,
+                            cooking_state.get("runStatus", "N/A"),
+                            cooking_state.get("cookingStatus", "N/A"),
+                            cooking_state.get("remoteEnable", "N/A")
+                        )
+                else:
+                    _LOGGER.error(
+                        "[COMMAND_OUTCOME] Command %s (correlation=%s)",
+                        outcome,
+                        correlation_label,
+                    )
+                if did:
+                    self._schedule_command_recovery(did)
             else:
                 _LOGGER.info(
                     "[COMMAND_OUTCOME] Command completed: %s (correlation=%s)",
                     outcome,
-                    correlation_id[:8] if len(correlation_id) > 8 else correlation_id
+                    correlation_label,
                 )
             return
         
@@ -1633,6 +1650,8 @@ class SmartHQWebsocket:
 
         # Update store and send signal
         if changed and did:
+            # A service event is newer than any command-failure REST snapshot still in flight.
+            self._advance_device_epoch(did)
             dev = self._store.setdefault(did, {})
             snap = dev.setdefault("snapshot", {"raw": {}, "services": {}, "index": {}})
             
