@@ -285,7 +285,9 @@ async def async_setup_entry(
                         if uid not in created:
                             created.add(uid)
                             coord_entities.append(
-                                SmartHQDoorBinarySensor(hass, entry, device_id, service_id, "Door", uid)
+                                SmartHQDoorBinarySensor(
+                                    hass, entry, device_id, service_id, "Door", uid, toggle_backed=True
+                                )
                             )
                         continue
                     if CMD_TOGGLE_SET in cmds or dom != FILTER_STATUS_DOMAIN:
@@ -484,11 +486,14 @@ class SmartHQDoorBinarySensor(BinarySensorEntity):
         service_id: str,
         label: str,
         unique_id: str,
+        *,
+        toggle_backed: bool = False,
     ) -> None:
         self.hass = hass
         self._entry = entry
         self._device_id = device_id
         self._service_id = service_id
+        self._toggle_backed = toggle_backed
         self._attr_name = label
         self._attr_unique_id = unique_id
 
@@ -499,8 +504,11 @@ class SmartHQDoorBinarySensor(BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return True when any documented door-open flag is true."""
+        """Return True when the door is open."""
         st = self._get_state()
+        if self._toggle_backed:
+            on = st.get("on")
+            return on if isinstance(on, bool) else False
         for key, value in st.items():
             if key.endswith("Open") and isinstance(value, bool) and value:
                 return True

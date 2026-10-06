@@ -27,13 +27,19 @@ def _store_for(service_id: str, state: dict) -> dict:
     }
 
 
-def _create_door_entity(state: dict) -> SmartHQDoorBinarySensor:
+def _create_door_entity(state: dict, *, toggle_backed: bool = False) -> SmartHQDoorBinarySensor:
     hass = MagicMock()
     hass.data = _store_for(DOOR_SERVICE_ID, state)
     entry = MagicMock()
     entry.entry_id = "test-entry"
     return SmartHQDoorBinarySensor(
-        hass, entry, DEVICE_ID, DOOR_SERVICE_ID, "Door", "test-door-uid"
+        hass,
+        entry,
+        DEVICE_ID,
+        DOOR_SERVICE_ID,
+        "Door",
+        "test-door-uid",
+        toggle_backed=toggle_backed,
     )
 
 
@@ -73,9 +79,19 @@ def test_door_closed_when_open_flags_false():
 
 
 def test_door_ignores_legacy_door_state_keys():
-    """Legacy doorState/state/open/on must not drive is_on."""
+    """Legacy doorState/state/open/on must not drive is_on on DOOR_SERVICE."""
     assert _create_door_entity({"doorState": "open"}).is_on is False
     assert _create_door_entity({"state": "open", "open": True, "on": True}).is_on is False
+
+
+def test_toggle_backed_door_open():
+    """A read-only toggle on DOOR_DOMAIN reports open via on=True."""
+    assert _create_door_entity({"on": True}, toggle_backed=True).is_on is True
+
+
+def test_toggle_backed_door_closed():
+    """A read-only toggle on DOOR_DOMAIN reports closed via on=False."""
+    assert _create_door_entity({"on": False}, toggle_backed=True).is_on is False
 
 
 def test_door_unavailable_when_service_missing():
