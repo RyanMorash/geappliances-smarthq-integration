@@ -644,3 +644,233 @@ async def test_smoke_level_socket_send_removed() -> None:
     """Smoke level is not sent as service#command on the websocket."""
     assert not hasattr(SmartHQWebsocket, "async_set_smoke_level")
     assert not hasattr(SmartHQWebsocket, "_optimistic_toggle_update")
+
+
+_TOGGLE = "cloud.smarthq.service.toggle"
+_LIGHT_DOMAIN = "cloud.smarthq.domain.light"
+_SMOKER = "cloud.smarthq.device.smoker"
+_LIGHT_DEVICE = "cloud.smarthq.device.light"
+
+
+def _indexed_store(device_id: str = "device-1") -> dict:
+    """One device whose only service tuple is the smoker light toggle."""
+    return {
+        device_id: {
+            "snapshot": {
+                "services": {
+                    "svc-1": {
+                        "on": False,
+                        "serviceType": _TOGGLE,
+                        "domainType": _LIGHT_DOMAIN,
+                        "serviceDeviceType": _SMOKER,
+                    }
+                },
+                "index": {(_TOGGLE, _LIGHT_DOMAIN, _SMOKER): "svc-1"},
+                "raw": {},
+            }
+        }
+    }
+
+
+def _device_event(device_id: str, service_device_type: str, *, event: str = "updated") -> dict:
+    """pubsub#device carrying one service tuple."""
+    return {
+        "kind": "pubsub#device",
+        "deviceId": device_id,
+        "event": event,
+        "services": [
+            {
+                "serviceId": "svc-1",
+                "serviceType": _TOGGLE,
+                "domainType": _LIGHT_DOMAIN,
+                "serviceDeviceType": service_device_type,
+                "state": {"on": True},
+            }
+        ],
+    }
+
+
+def _reload_hass() -> MagicMock:
+    """Hass whose async_create_task runs the reload coroutine."""
+    hass = MagicMock()
+    hass.config_entries.async_reload = AsyncMock()
+
+    def _create_task(coro):
+        return asyncio.get_running_loop().create_task(coro)
+
+    hass.async_create_task.side_effect = _create_task
+    return hass
+
+
+async def test_device_item_index_keeps_distinct_service_device_types() -> None:
+    """REST device snapshots index each (type, domain, serviceDeviceType)."""
+    device_id = "device-1"
+    store: dict = {device_id: {}}
+    websocket = SmartHQWebsocket(MagicMock(), api=MagicMock(), device_ids=[device_id], store=store)
+    websocket._write_device_item_to_store(
+        device_id,
+        {
+            "services": [
+                {
+                    "serviceId": "svc-smoker",
+                    "serviceType": _TOGGLE,
+                    "domainType": _LIGHT_DOMAIN,
+                    "serviceDeviceType": _SMOKER,
+                    "state": {"on": False},
+                },
+                {
+                    "serviceId": "svc-light",
+                    "serviceType": _TOGGLE,
+                    "domainType": _LIGHT_DOMAIN,
+                    "serviceDeviceType": _LIGHT_DEVICE,
+                    "state": {"on": True},
+                },
+            ]
+        },
+    )
+
+    index = store[device_id]["snapshot"]["index"]
+    assert index[(_TOGGLE, _LIGHT_DOMAIN, _SMOKER)] == "svc-smoker"
+    assert index[(_TOGGLE, _LIGHT_DOMAIN, _LIGHT_DEVICE)] == "svc-light"
+    assert len(index) == 2
+
+
+async def test_metadata_lookup_reads_service_device_type_from_index() -> None:
+    """Index lookups use the 3-tuple, including serviceDeviceType."""
+    device_id = "device-abcdef12"
+    service_id = "svc-1"
+    store = {
+        device_id: {
+            "info": {},
+            "snapshot": {
+                "services": {},
+                "index": {(_TOGGLE, _LIGHT_DOMAIN, _LIGHT_DEVICE): service_id},
+                "raw": {},
+            },
+        }
+    }
+    websocket = SmartHQWebsocket(MagicMock(), api=MagicMock(), device_ids=[device_id], store=store)
+
+    meta = websocket._get_service_metadata(device_id, service_id)
+
+    assert meta["serviceType"] == _TOGGLE
+    assert meta["domainType"] == _LIGHT_DOMAIN
+    assert meta["serviceDeviceType"] == _LIGHT_DEVICE
+
+
+async def test_service_update_indexes_three_tuples_and_does_not_reload() -> None:
+    """pubsub#service updates state and the 3-tuple index, and does not reload."""
+    device_id = "device-1"
+    store = _indexed_store(device_id)
+    hass = _reload_hass()
+    websocket = SmartHQWebsocket(
+        hass, api=MagicMock(), device_ids=[device_id], store=store, entry_id="entry-1"
+    )
+    payload = {
+        "kind": "pubsub#service",
+        "deviceId": device_id,
+        "services": [
+            {
+                "serviceId": "svc-1",
+                "serviceType": _TOGGLE,
+                "domainType": _LIGHT_DOMAIN,
+                "serviceDeviceType": _SMOKER,
+                "state": {"on": True},
+            },
+            {
+                "serviceId": "svc-2",
+                "serviceType": _TOGGLE,
+                "domainType": _LIGHT_DOMAIN,
+                "serviceDeviceType": _LIGHT_DEVICE,
+                "state": {"on": False},
+            },
+        ],
+    }
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send"):
+        await websocket._on_message(payload)
+
+    index = store[device_id]["snapshot"]["index"]
+    assert index[(_TOGGLE, _LIGHT_DOMAIN, _SMOKER)] == "svc-1"
+    assert index[(_TOGGLE, _LIGHT_DOMAIN, _LIGHT_DEVICE)] == "svc-2"
+    assert store[device_id]["snapshot"]["services"]["svc-1"]["on"] is True
+    assert websocket._reload_handle is None
+    hass.config_entries.async_reload.assert_not_called()
+
+
+async def test_device_event_with_same_tuples_does_not_reload() -> None:
+    """A pubsub#device that repeats the current service tuples does not reload."""
+    device_id = "device-1"
+    store = _indexed_store(device_id)
+    hass = _reload_hass()
+    websocket = SmartHQWebsocket(
+        hass, api=MagicMock(), device_ids=[device_id], store=store, entry_id="entry-1"
+    )
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send") as mock_dispatch:
+        await websocket._on_message(_device_event(device_id, _SMOKER))
+
+    assert store[device_id]["snapshot"]["services"]["svc-1"]["on"] is False
+    assert websocket._reload_handle is None
+    hass.config_entries.async_reload.assert_not_called()
+    mock_dispatch.assert_not_called()
+
+
+async def test_device_tuple_change_schedules_reload() -> None:
+    """A new serviceDeviceType on pubsub#device schedules one reload."""
+    device_id = "device-1"
+    store = _indexed_store(device_id)
+    hass = _reload_hass()
+    websocket = SmartHQWebsocket(
+        hass, api=MagicMock(), device_ids=[device_id], store=store, entry_id="entry-1"
+    )
+
+    await websocket._on_message(_device_event(device_id, _LIGHT_DEVICE))
+
+    assert websocket._reload_handle is not None
+    websocket._cancel_entry_reload()
+    hass.config_entries.async_reload.assert_not_called()
+
+
+async def test_new_device_and_removed_device_schedule_reload() -> None:
+    """Adding or removing a device id schedules a reload."""
+    device_id = "device-1"
+    store = _indexed_store(device_id)
+    hass = _reload_hass()
+    websocket = SmartHQWebsocket(
+        hass, api=MagicMock(), device_ids=[device_id], store=store, entry_id="entry-1"
+    )
+
+    created = _device_event("device-2", _SMOKER, event="created")
+    await websocket._on_message(created)
+    assert websocket._reload_handle is not None
+    websocket._cancel_entry_reload()
+
+    await websocket._on_message(_device_event(device_id, _SMOKER, event="deleted"))
+    assert websocket._reload_handle is not None
+    websocket._cancel_entry_reload()
+    hass.config_entries.async_reload.assert_not_called()
+
+
+async def test_device_set_changes_debounce_to_one_reload() -> None:
+    """Several pubsub#device changes schedule a single config-entry reload."""
+    device_id = "device-1"
+    store = _indexed_store(device_id)
+    hass = _reload_hass()
+    websocket = SmartHQWebsocket(
+        hass, api=MagicMock(), device_ids=[device_id], store=store, entry_id="entry-1"
+    )
+
+    await websocket._on_message(_device_event("device-new-1", _SMOKER, event="created"))
+    first = websocket._reload_handle
+    assert first is not None
+    await websocket._on_message(_device_event("device-new-2", _LIGHT_DEVICE, event="created"))
+    assert websocket._reload_handle is not None
+    assert websocket._reload_handle is not first
+    assert first.cancelled()
+
+    websocket._cancel_entry_reload()
+    websocket._fire_entry_reload()
+    await asyncio.sleep(0)
+
+    hass.config_entries.async_reload.assert_awaited_once_with("entry-1")
