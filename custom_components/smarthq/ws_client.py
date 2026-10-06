@@ -4,7 +4,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import aiohttp
 from homeassistant.core import HomeAssistant
@@ -18,6 +20,42 @@ _LOGGER = logging.getLogger(__name__)
 
 PING_IDLE_SECONDS = 60
 RESUBSCRIBE_SECONDS = 300
+TOKEN_RECONNECT_MARGIN_SECONDS = 60
+DEFAULT_TOKEN_LIFETIME_SECONDS = 3600
+KEEPALIVE_POLL_SECONDS = 5
+
+
+def _ws_endpoint_host_for_log(endpoint: str) -> str:
+    """Return websocket host for logs (never log credentials)."""
+    parsed = urlparse(endpoint)
+    return parsed.hostname or "unknown"
+
+
+def _strip_access_token_from_url(url: str) -> str:
+    """Remove access_token from a websocket URL if present."""
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+    filtered = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() != "access_token"
+    ]
+    return urlunparse(parsed._replace(query=urlencode(filtered)))
+
+
+def _presence_from_payload(presence: Any) -> Dict[str, Any]:
+    """Normalize websocket presence payloads for the live store."""
+    if isinstance(presence, dict):
+        if "presence" in presence:
+            return dict(presence)
+        status = presence.get("status")
+        if isinstance(status, str):
+            return {"presence": status.upper()}
+        return dict(presence)
+    if isinstance(presence, str):
+        return {"presence": presence.upper()}
+    return {}
 
 
 def _iter_service_items(container: Any) -> Iterable[Dict[str, Any]]:
@@ -90,9 +128,12 @@ class SmartHQWebsocket:
         while not self._stopped.is_set():
             try:
                 endpoint = await self._api.async_get_websocket_endpoint()
-                _LOGGER.info("Connecting SmartHQ WS -> %s", endpoint)
+                _LOGGER.info(
+                    "Connecting SmartHQ WS -> %s",
+                    _ws_endpoint_host_for_log(_strip_access_token_from_url(endpoint)),
+                )
 
-                async with self._session.ws_connect(endpoint, heartbeat=PING_IDLE_SECONDS) as ws:
+                async with self._session.ws_connect(endpoint, heartbeat=None) as ws:
                     self._ws = ws
                     _LOGGER.info("SmartHQ WS connected")
                     if notified_failure:
@@ -107,34 +148,7 @@ class SmartHQWebsocket:
                     notified_failure = False
 
                     await self._subscribe_all(ws)
-
-                    loop = asyncio.get_event_loop()
-                    last_activity = loop.time()
-                    last_subscribe = last_activity
-
-                    async for msg in ws:
-                        now = loop.time()
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            last_activity = now
-                            try:
-                                payload = json.loads(msg.data)
-
-                                _LOGGER.debug("[WS_RECV_RAW] %s", json.dumps(payload, indent=2))
-                                await self._on_message(payload)
-                            except Exception as e:
-                                _LOGGER.debug("WS message parse error: %s data=%s", e, msg.data)
-                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
-                            raise aiohttp.ClientError(str(msg))
-
-                        if now - last_activity > PING_IDLE_SECONDS:
-                            with contextlib.suppress(Exception):
-                                await ws.send_json({"kind": "websocket#ping", "action": "ping"})
-                            last_activity = now
-
-                        if now - last_subscribe > RESUBSCRIBE_SECONDS:
-                            with contextlib.suppress(Exception):
-                                await self._subscribe_all(ws)
-                            last_subscribe = now
+                    await self._run_connected_session(ws)
 
             except asyncio.CancelledError:
                 break
@@ -184,6 +198,147 @@ class SmartHQWebsocket:
                 backoff = min(backoff * 2, 60)
             finally:
                 self._ws = None
+                if not self._stopped.is_set():
+                    await self._refetch_devices_after_disconnect()
+
+    async def _token_reconnect_deadline(self) -> float:
+        """Wall-clock time when the socket should close ahead of token expiry."""
+        oauth = await self._api._oauth_session()
+        await oauth.async_ensure_token_valid()
+        token = oauth.token or {}
+        now = time.time()
+        expires_at = token.get("expires_at")
+        if expires_at is not None:
+            return float(expires_at) - TOKEN_RECONNECT_MARGIN_SECONDS
+        expires_in = token.get("expires_in")
+        if expires_in is not None:
+            return now + float(expires_in) - TOKEN_RECONNECT_MARGIN_SECONDS
+        return now + DEFAULT_TOKEN_LIFETIME_SECONDS - TOKEN_RECONNECT_MARGIN_SECONDS
+
+    def _write_device_item_to_store(self, device_id: str, item: Dict[str, Any]) -> None:
+        """Merge GET /v2/device/{id} services into the live store."""
+        services_raw = item.get("services") or []
+        services_map: Dict[str, Dict[str, Any]] = {}
+        index_map: Dict[tuple, str] = {}
+        dev = self._store.setdefault(device_id, {})
+        info = dev.get("info") or {}
+
+        for svc in services_raw:
+            sid = str(svc.get("serviceId") or "")
+            stype = str(svc.get("serviceType") or "")
+            dtype = str(svc.get("domainType") or "")
+            state = svc.get("state") or {}
+
+            if sid:
+                full_state = dict(state) if isinstance(state, dict) else {}
+                full_state["serviceType"] = stype
+                full_state["domainType"] = dtype
+                if "serviceDeviceType" in svc:
+                    full_state["serviceDeviceType"] = svc["serviceDeviceType"]
+                services_map[sid] = full_state
+            if stype and dtype and sid:
+                index_map[(stype, dtype)] = sid
+
+        snap = dev.setdefault("snapshot", {"raw": {}, "services": {}, "index": {}})
+        snap["raw"] = item
+        snap["services"] = services_map
+        snap["index"] = index_map
+        if item.get("deviceType"):
+            snap["deviceType"] = item.get("deviceType")
+        if not info and item.get("nickname"):
+            dev["info"] = {
+                **info,
+                "nickname": item.get("nickname"),
+                "deviceType": item.get("deviceType"),
+            }
+
+    async def _refetch_devices_after_disconnect(self) -> None:
+        """Refresh known device snapshots over REST after the websocket drops."""
+        for device_id in list(self._device_ids):
+            try:
+                item = await self._api.async_get_device_item(device_id)
+            except Exception as err:
+                _LOGGER.debug(
+                    "Post-disconnect refetch failed for %s: %s",
+                    device_id[:8],
+                    err,
+                )
+                continue
+            if not item:
+                continue
+            self._write_device_item_to_store(device_id, item)
+            async_dispatcher_send(
+                self.hass,
+                SIGNAL_DEVICE_UPDATED.format(device_id=device_id),
+            )
+
+    async def _maybe_send_idle_ping(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        *,
+        last_activity: float,
+        now: float,
+    ) -> float:
+        """Send JSON keepalive when no websocket traffic has arrived recently."""
+        if now - last_activity >= PING_IDLE_SECONDS:
+            with contextlib.suppress(Exception):
+                await ws.send_json({"kind": "websocket#ping", "action": "ping"})
+            return now
+        return last_activity
+
+    async def _run_connected_session(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Receive websocket traffic and run keepalive/resubscribe beside the reader."""
+        loop = asyncio.get_running_loop()
+        last_activity = loop.time()
+        last_subscribe = last_activity
+        token_deadline = await self._token_reconnect_deadline()
+        receive_done = asyncio.Event()
+
+        async def _receive_loop() -> None:
+            nonlocal last_activity
+            try:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        last_activity = loop.time()
+                        try:
+                            payload = json.loads(msg.data)
+
+                            _LOGGER.debug("[WS_RECV_RAW] %s", json.dumps(payload, indent=2))
+                            await self._on_message(payload)
+                        except Exception as e:
+                            _LOGGER.debug("WS message parse error: %s data=%s", e, msg.data)
+                    elif msg.type in (
+                        aiohttp.WSMsgType.ERROR,
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSED,
+                    ):
+                        raise aiohttp.ClientError(str(msg))
+            finally:
+                receive_done.set()
+
+        async def _keepalive_loop() -> None:
+            nonlocal last_activity, last_subscribe
+            while not receive_done.is_set() and not ws.closed:
+                await asyncio.sleep(KEEPALIVE_POLL_SECONDS)
+                now = loop.time()
+                last_activity = await self._maybe_send_idle_ping(
+                    ws, last_activity=last_activity, now=now
+                )
+
+                if now - last_subscribe > RESUBSCRIBE_SECONDS:
+                    with contextlib.suppress(Exception):
+                        await self._subscribe_all(ws)
+                    last_subscribe = now
+
+                if time.time() >= token_deadline:
+                    _LOGGER.info(
+                        "SmartHQ WS reconnecting before access token expiry"
+                    )
+                    with contextlib.suppress(Exception):
+                        await ws.close()
+                    return
+
+        await asyncio.gather(_receive_loop(), _keepalive_loop())
 
     async def _subscribe_all(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Subscribe to pubsub for account and all devices (strictly follow documentation)."""
@@ -193,7 +348,8 @@ class SmartHQWebsocket:
             "action": "pubsub",
             "pubsub": True,
             "services": True,
-            "presence": False,
+            "presence": True,
+            "commands": True,
             "alerts": True
         }
         _LOGGER.info("[SUBSCRIBE] Sending global subscription (FIXED): %s", json.dumps(global_sub, indent=2))
@@ -207,7 +363,8 @@ class SmartHQWebsocket:
                 "action": "pubsub",
                 "deviceId": did,
                 "services": True,
-                "presence": False,
+                "presence": True,
+                "commands": True,
                 "alerts": True
             }
             _LOGGER.info(
@@ -1366,8 +1523,7 @@ class SmartHQWebsocket:
         # Handle presence
         if "presence" in payload and did:
             dev = self._store.setdefault(did, {})
-            pres = payload.get("presence")
-            dev["presence"] = pres if isinstance(pres, dict) else {"status": pres}
+            dev["presence"] = _presence_from_payload(payload.get("presence"))
             _LOGGER.debug("[PRESENCE] %s: %s", did[:8], dev["presence"])
             async_dispatcher_send(self.hass, SIGNAL_DEVICE_UPDATED.format(device_id=did))
             return
