@@ -112,7 +112,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     full_state["config"] = svc["config"]
                 services_map[sid] = full_state
             if stype and dtype and sid:
-                index_map[(stype, dtype)] = sid
+                sdev = str(svc.get("serviceDeviceType") or "")
+                index_map[(stype, dtype, sdev)] = sid
         
         snapshot = {
             "raw": item,
@@ -141,6 +142,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         api=api,
         store=store,
         device_ids=list(store.keys()),
+        entry_id=entry.entry_id,
     )
     await _ws_start(ws)
 
@@ -341,7 +343,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     tokens.append(m if isinstance(m, str) else str(m.get("token")))
                 # Reverse index (if available)
                 rev = {v: k for k, v in index.items()} if isinstance(index, dict) else {}
-                pair = rev.get(sid)  # ('cloud.smarthq.service.mode','cloud.smarthq.domain.light')
+                pair = rev.get(sid)  # (serviceType, domainType, serviceDeviceType)
                 lines.append(
                     f"- {sid}\n"
                     f"  type={stype}  domain={dom}  label={label}\n"

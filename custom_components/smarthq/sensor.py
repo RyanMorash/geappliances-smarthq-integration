@@ -469,8 +469,8 @@ class SmartHQSnapshotSensor(SensorEntity):
         snap = _snapshot_for(self.hass, self._entry, self._device_id)
         services = snap.get("services") or {}
         st = services.get(self._service_id) or {}
-        # Read stype/dom directly from the stored service state to avoid lossy
-        # index_map dedup (index_map only keeps the last sid per (stype,dom) pair).
+        # Read stype/dom from this service id. The index is
+        # (serviceType, domainType, serviceDeviceType) -> serviceId, not state.
         stype = st.get("serviceType") or ""
         dom = st.get("domainType") or ""
         return st, stype, dom
@@ -1023,11 +1023,9 @@ def _iter_dynamic_sensors(
         return []
     exclude_pairs = exclude_pairs or set()
 
-    # Build sid -> (serviceType, domainType) directly from services_map so that
-    # services sharing the same (stype, domain) but different serviceDeviceType
-    # (e.g. two temperature/measurement services: probe vs smoker cavity) are
-    # ALL included.  The index_map only stores the last sid per (stype,dom) key
-    # which would silently drop duplicates.
+    # Build sid -> (serviceType, domainType) from the services map so every
+    # service id is included, including two measurements that share a domain
+    # and differ by serviceDeviceType. State lives on the service, not the index.
     rev: Dict[str, Tuple[str, str]] = {
         sid: (str(st.get("serviceType") or ""), str(st.get("domainType") or ""))
         for sid, st in services.items()

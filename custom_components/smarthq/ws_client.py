@@ -96,6 +96,159 @@ def _extract_service_tuple(item: Dict[str, Any]) -> Tuple[str, str, str, Dict[st
     return sid, stype, dom, state
 
 
+def _service_index_key(item: Dict[str, Any]) -> Tuple[str, str, str] | None:
+    """Return (serviceType, domainType, serviceDeviceType) when the pair is present."""
+    stype = str(item.get("serviceType") or "")
+    dom = str(item.get("domainType") or "")
+    if not stype or not dom:
+        return None
+    return stype, dom, str(item.get("serviceDeviceType") or "")
+
+
+def _dict_layer(value: Any) -> Dict[str, Any]:
+    """Return a payload wrapper only when it is a dict."""
+    return value if isinstance(value, dict) else {}
+
+
+_MISSING = object()
+
+
+def _payload_field(payload: Dict[str, Any], key: str) -> Any:
+    """Read key from the top level, then item, then body.
+
+    Same precedence as the device id extractor. A missing result means none of
+    those layers contained the key.
+    """
+    if key in payload:
+        return payload[key]
+    item = _dict_layer(payload.get("item"))
+    if key in item:
+        return item[key]
+    body = _dict_layer(payload.get("body"))
+    if key in body:
+        return body[key]
+    return _MISSING
+
+
+def _service_device_type_for_index(item: Dict[str, Any], cached_state: Any) -> str:
+    """Event component, or the cached component when this update omits it."""
+    incoming = item.get("serviceDeviceType") if isinstance(item, dict) else None
+    if incoming:
+        return str(incoming)
+    if isinstance(cached_state, dict) and cached_state.get("serviceDeviceType"):
+        return str(cached_state["serviceDeviceType"])
+    return ""
+
+
+def _cached_service_state(store: Dict[str, Any], device_id: str | None, service_id: str) -> Dict[str, Any]:
+    """Service state already in the live store, if any."""
+    if not device_id:
+        return {}
+    dev = (store or {}).get(device_id) or {}
+    services = (dev.get("snapshot") or {}).get("services") or {}
+    state = services.get(service_id) or {}
+    return state if isinstance(state, dict) else {}
+
+
+def _service_tuples_from_container(container: Any) -> set[Tuple[str, str, str]]:
+    """Collect service tuples from a list or nested service payload."""
+    items: List[Dict[str, Any]] = []
+    if isinstance(container, list):
+        items = [item for item in container if isinstance(item, dict)]
+    elif isinstance(container, dict):
+        nested = list(_iter_service_items(container))
+        items = nested or [item for item in container.values() if isinstance(item, dict)]
+    found: set[Tuple[str, str, str]] = set()
+    for item in items:
+        key = _service_index_key(item)
+        if key:
+            found.add(key)
+    return found
+
+
+def _device_service_tuples(dev: Dict[str, Any]) -> set[Tuple[str, str, str]]:
+    """Service tuples stored for one device."""
+    snap = dev.get("snapshot") or {}
+    tuples: set[Tuple[str, str, str]] = set()
+    services = snap.get("services") or {}
+    if isinstance(services, dict):
+        for state in services.values():
+            if isinstance(state, dict):
+                key = _service_index_key(state)
+                if key:
+                    tuples.add(key)
+    if tuples:
+        return tuples
+    index = snap.get("index") or {}
+    if isinstance(index, dict):
+        for key in index:
+            if isinstance(key, tuple) and len(key) >= 3 and key[0] and key[1]:
+                tuples.add((str(key[0]), str(key[1]), str(key[2] or "")))
+    return tuples
+
+
+def _store_entity_sets(store: Dict[str, Any]) -> tuple[set[str], set[Tuple[str, str, str, str]]]:
+    """Return device ids and (device id, serviceType, domainType, serviceDeviceType)."""
+    device_ids: set[str] = set()
+    tuples: set[Tuple[str, str, str, str]] = set()
+    for device_id, dev in (store or {}).items():
+        if not isinstance(dev, dict):
+            continue
+        device_ids.add(str(device_id))
+        for stype, dom, sdev in _device_service_tuples(dev):
+            tuples.add((str(device_id), stype, dom, sdev))
+    return device_ids, tuples
+
+
+_DEVICE_REMOVED_EVENTS = frozenset({"deleted", "removed", "delete", "remove"})
+
+
+def _device_event_removes(event: Any) -> bool:
+    """True when a pubsub#device event takes a device off the account."""
+    if not isinstance(event, str):
+        return False
+    token = event.strip().lower().rsplit(".", 1)[-1]
+    return token in _DEVICE_REMOVED_EVENTS
+
+
+def _entity_set_changed(
+    device_ids: set[str],
+    service_tuples: set[Tuple[str, str, str, str]],
+    payload: Dict[str, Any],
+    device_id: str,
+) -> bool:
+    """True when a pubsub#device event changes the setup-time device or service set.
+
+    ``device_ids`` and ``service_tuples`` are the sets captured when platforms
+    were built. Later pubsub#service updates must not move that baseline.
+    ``event`` and ``services`` are read from the top level, then ``item``, then
+    ``body``.
+    """
+    device_id = str(device_id or "")
+    if not device_id:
+        return False
+
+    event = _payload_field(payload, "event")
+    services = _payload_field(payload, "services")
+    if _device_event_removes(None if event is _MISSING else event):
+        projected_devices = set(device_ids) - {device_id}
+        projected_tuples = {item for item in service_tuples if item[0] != device_id}
+    else:
+        projected_devices = set(device_ids)
+        projected_devices.add(device_id)
+        if services is _MISSING:
+            projected_tuples = set(service_tuples)
+        else:
+            projected_tuples = {item for item in service_tuples if item[0] != device_id}
+            for stype, dom, sdev in _service_tuples_from_container(services):
+                projected_tuples.add((device_id, stype, dom, sdev))
+    return projected_devices != set(device_ids) or projected_tuples != set(service_tuples)
+
+
+# Burst of device-added/updated events should rebuild entities once.
+ENTITY_SET_RELOAD_DEBOUNCE_SECONDS = 2.0
+
+
 # pubsub#command summary buckets that mean the appliance did not apply the command.
 _COMMAND_REFETCH_OUTCOMES = frozenset({"failed", "timeout", "unknown"})
 
@@ -111,10 +264,19 @@ def _command_outcome_needs_refetch(outcome: Any) -> bool:
 class SmartHQWebsocket:
     """SmartHQ WebSocket client."""
 
-    def __init__(self, hass: HomeAssistant, *, api: SmartHQApi, device_ids: List[str], store: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        *,
+        api: SmartHQApi,
+        device_ids: List[str],
+        store: Dict[str, Any],
+        entry_id: str | None = None,
+    ) -> None:
         self.hass = hass
         self._api = api
         self._store = store or {}
+        self._entry_id = entry_id
         incoming = set(device_ids or [])
         known_in_store = {k for k, v in (self._store or {}).items() if isinstance(v, dict)}
         self._device_ids = set(incoming or known_in_store)
@@ -126,6 +288,10 @@ class SmartHQWebsocket:
         self._device_epochs: Dict[str, int] = {}
         self._recovery_tasks: set[asyncio.Task] = set()
         self._recovery_locks: Dict[str, asyncio.Lock] = {}
+        self._reload_handle: asyncio.TimerHandle | None = None
+        # Entity discovery uses this snapshot, not the live store. pubsub#service
+        # can add a service here without creating its entity.
+        self._setup_device_ids, self._setup_service_tuples = _store_entity_sets(self._store)
 
     async def start(self) -> None:
         """Start the WebSocket connection."""
@@ -135,6 +301,7 @@ class SmartHQWebsocket:
     async def stop(self) -> None:
         """Stop the WebSocket connection."""
         self._stopped.set()
+        self._cancel_entry_reload()
         if self._task:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -278,7 +445,7 @@ class SmartHQWebsocket:
                     full_state["config"] = svc["config"]
                 services_map[sid] = full_state
             if stype and dtype and sid:
-                index_map[(stype, dtype)] = sid
+                index_map[(stype, dtype, str(svc.get("serviceDeviceType") or ""))] = sid
 
         snap = dev.setdefault("snapshot", {"raw": {}, "services": {}, "index": {}})
         snap["raw"] = item
@@ -1334,34 +1501,35 @@ class SmartHQWebsocket:
                 )
                 return result
         
-        # 3. Reverse infer from index
+        # 3. Reverse infer from index. Keys are (serviceType, domainType, serviceDeviceType).
         index = snap.get("index", {})
-        for (stype, dtype), sid in index.items():
-            if sid == service_id:
-                # serviceDeviceType must be fetched directly from services!
+        for key, sid in index.items():
+            if sid != service_id or not isinstance(key, tuple) or len(key) < 2:
+                continue
+            stype = str(key[0] or "")
+            dtype = str(key[1] or "")
+            service_device_type = str(key[2] or "") if len(key) >= 3 else ""
+            if not service_device_type:
                 svc_state = services.get(service_id, {})
                 service_device_type = svc_state.get("serviceDeviceType", "")
-                
                 parent_device_type = info.get("deviceType", "")
-                
-                # Fallback: use parent deviceType if serviceDeviceType is missing
                 if not service_device_type:
                     _LOGGER.warning(
                         "[METADATA] serviceDeviceType missing, using parent deviceType: %s",
                         parent_device_type
                     )
                     service_device_type = parent_device_type
-                
-                result = {
-                    "serviceType": stype,
-                    "domainType": dtype,
-                    "serviceDeviceType": service_device_type,
-                }
-                _LOGGER.debug(
-                    "[METADATA] Found via index (case 3): %s",
-                    json.dumps(result, indent=2)
-                )
-                return result
+
+            result = {
+                "serviceType": stype,
+                "domainType": dtype,
+                "serviceDeviceType": service_device_type,
+            }
+            _LOGGER.debug(
+                "[METADATA] Found via index (case 3): %s",
+                json.dumps(result, indent=2)
+            )
+            return result
         
         # 4. Final fallback
         _LOGGER.warning(
@@ -1374,6 +1542,43 @@ class SmartHQWebsocket:
             "domainType": "",
             "serviceDeviceType": info.get("deviceType", ""),
         }
+
+    def _cancel_entry_reload(self) -> None:
+        """Drop a pending entity-set reload."""
+        handle = self._reload_handle
+        self._reload_handle = None
+        if handle is not None:
+            handle.cancel()
+
+    def _schedule_entry_reload(self, device_id: str) -> None:
+        """Debounce one config-entry reload after the device or service set changes."""
+        if not self._entry_id:
+            _LOGGER.debug("[ENTITY_SET] Device set changed but no config entry is attached")
+            return
+        self._cancel_entry_reload()
+        _LOGGER.info(
+            "[ENTITY_SET] Scheduling config entry reload after device set change (%s)",
+            device_id[:8] if device_id else "?",
+        )
+        loop = asyncio.get_running_loop()
+        self._reload_handle = loop.call_later(
+            ENTITY_SET_RELOAD_DEBOUNCE_SECONDS,
+            self._fire_entry_reload,
+        )
+
+    def _fire_entry_reload(self) -> None:
+        """Run the debounced reload on the event loop."""
+        self._reload_handle = None
+        if self._stopped.is_set() or not self._entry_id:
+            return
+        self.hass.async_create_task(self._async_reload_entry())
+
+    async def _async_reload_entry(self) -> None:
+        """Reload this integration entry so platforms rebuild their entities."""
+        entry_id = self._entry_id
+        if not entry_id or self._stopped.is_set():
+            return
+        await self.hass.config_entries.async_reload(entry_id)
 
     async def _on_message(self, payload: Dict[str, Any]) -> None:
         """Apply events to store and notify entities."""
@@ -1468,6 +1673,21 @@ class SmartHQWebsocket:
             if did not in self._device_ids:
                 self._device_ids.add(did)
                 _LOGGER.debug("Learned new deviceId: %s", did)
+
+        # Device added, removed, or its service set changed. Rebuild entities
+        # with one debounced reload. Do not add or remove entities in place,
+        # and do not treat this payload as a service-state update.
+        if kind == "pubsub#device":
+            if did and _entity_set_changed(
+                self._setup_device_ids,
+                self._setup_service_tuples,
+                payload,
+                str(did),
+            ):
+                self._schedule_entry_reload(str(did))
+            else:
+                _LOGGER.debug("[ENTITY_SET] pubsub#device left devices and service tuples unchanged")
+            return
 
         # pubsub#command is an outcome, not the new service state.
         # Success still waits for pubsub#service. failed/timeout/unknown refetch REST.
@@ -1617,15 +1837,19 @@ class SmartHQWebsocket:
                     continue
                 sid, stype, dom, state = tup
                 
-                # Preserve metadata in state (used when sending commands)
+                # Preserve metadata in state (used when sending commands).
+                # An update that omits serviceDeviceType keeps the cached component
+                # so the index does not grow a second empty-component key.
                 state["serviceType"] = stype
                 state["domainType"] = dom
-                if "serviceDeviceType" in item:
+                cached = _cached_service_state(self._store, did, sid)
+                sdev = _service_device_type_for_index(item, cached)
+                if item.get("serviceDeviceType"):
                     state["serviceDeviceType"] = item["serviceDeviceType"]
                 
                 svc_states[sid] = state
                 if stype and dom:
-                    index[(stype, dom)] = sid
+                    index[(stype, dom, sdev)] = sid
                 changed = True
 
         # Single service update
@@ -1634,19 +1858,21 @@ class SmartHQWebsocket:
             tup = _extract_service_tuple(item)
             if tup:
                 sid, stype, dom, state = tup
+                if not did:
+                    did = item.get("deviceId")
                 
-                # Preserve metadata in state
+                # Preserve metadata in state (used when sending commands).
                 state["serviceType"] = stype
                 state["domainType"] = dom
-                if "serviceDeviceType" in item:
+                cached = _cached_service_state(self._store, did, sid)
+                sdev = _service_device_type_for_index(item, cached)
+                if item.get("serviceDeviceType"):
                     state["serviceDeviceType"] = item["serviceDeviceType"]
                 
                 svc_states[sid] = state
                 if stype and dom:
-                    index[(stype, dom)] = sid
+                    index[(stype, dom, sdev)] = sid
                 changed = True
-                if not did:
-                    did = item.get("deviceId")
 
         # Update store and send signal
         if changed and did:
@@ -1687,8 +1913,13 @@ class SmartHQWebsocket:
                     if service_state.get("serviceType") == POWER_USAGE_SERVICE:
                         service_state["instantaneousPower"] = 0
             
-            # Update index
+            # Update index. Drop any previous key for the same service id so an
+            # omitted serviceDeviceType cannot leave a second empty-component entry.
             cur_index = snap.setdefault("index", {})
+            for key, indexed_sid in index.items():
+                stale = [existing for existing, sid in cur_index.items() if sid == indexed_sid and existing != key]
+                for existing in stale:
+                    cur_index.pop(existing, None)
             cur_index.update(index)
             
             _LOGGER.debug("[SERVICE_UPDATE] %s: %d services updated", did[:8], len(svc_states))

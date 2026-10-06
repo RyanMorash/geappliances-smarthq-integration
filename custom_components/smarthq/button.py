@@ -367,7 +367,23 @@ class SmartHQTriggerButton(_SmartHQButtonBase):
         #    - domain.stop   → available only when runStatus == running
         _LAUNDRY_STATE_STYPE = "cloud.smarthq.service.laundry.state.v1"
         _LAUNDRY_DOM = "cloud.smarthq.domain.laundry"
-        laundry_sid = index.get((_LAUNDRY_STATE_STYPE, _LAUNDRY_DOM))
+        sdev = str((self._svc or {}).get("serviceDeviceType") or "")
+        if not sdev:
+            sdev = str((services.get(self._service_id) or {}).get("serviceDeviceType") or "")
+        laundry_sid = index.get((_LAUNDRY_STATE_STYPE, _LAUNDRY_DOM, sdev))
+        if not laundry_sid:
+            # One laundry state service can use a different serviceDeviceType
+            # than the trigger. Prefer that only when it is unambiguous.
+            matches = [
+                sid
+                for key, sid in index.items()
+                if isinstance(key, tuple)
+                and len(key) >= 3
+                and key[0] == _LAUNDRY_STATE_STYPE
+                and key[1] == _LAUNDRY_DOM
+            ]
+            if len(matches) == 1:
+                laundry_sid = matches[0]
         _LOGGER.debug(
             "[TRIGGER_AVAIL] %s svc=%s index_keys=%s laundry_sid=%s",
             self._device_id[:8], self._service_id[:8] if self._service_id else "?",

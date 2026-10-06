@@ -125,11 +125,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
         if not isinstance(services_list, list):
             continue
 
-        # Per-device dedup: track (serviceType, domainType) pairs already handled.
-        # This prevents duplicate switch entities when the same domain appears in
-        # multiple service instances (e.g. Smoker Light State Service appears once
-        # for the smoker serviceDeviceType and once for the light serviceDeviceType).
-        seen_switch_domains: set[tuple[str, str]] = set()
+        # Per-device dedup: one switch per (serviceType, domainType, serviceDeviceType).
+        # The same type and domain with a different serviceDeviceType is another
+        # component and gets its own entity. Labels already include that value.
+        seen_switch_domains: set[tuple[str, str, str]] = set()
 
         for svc in services_list:
             if not isinstance(svc, dict):
@@ -151,20 +150,18 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
             # ── Route to entity builder based on serviceType ──
             if stype == TOGGLE_SERVICE and CMD_TOGGLE_SET in cmds:
-                # Skip if this device already has a toggle switch for this domain.
-                # Some devices expose the same domainType (e.g. controls.lock) as a
-                # separate toggle service instance per serviceDeviceType, which would
-                # otherwise create multiple identically-labeled switch entities
-                # (see MODE_SERVICE dedup below for the same class of issue).
-                dedup_key = (stype, dom)
+                # Skip only an exact tuple duplicate. A different serviceDeviceType
+                # is a separate switch (for example smoker cavity light vs light).
+                sdev = str(svc.get("serviceDeviceType") or "")
+                dedup_key = (stype, dom, sdev)
                 if dedup_key in seen_switch_domains:
                     _LOGGER.debug(
-                        "[SWITCH] Skipping duplicate toggle switch for device=%s domain=%s svc=%s",
-                        device_id, dom, service_id,
+                        "[SWITCH] Skipping duplicate toggle switch for device=%s domain=%s serviceDeviceType=%s svc=%s",
+                        device_id, dom, sdev, service_id,
                     )
                     continue
                 seen_switch_domains.add(dedup_key)
-                label, icon = _label_for_toggle(dom, svc.get("serviceDeviceType") or "")
+                label, icon = _label_for_toggle(dom, sdev)
                 entities.append(SmartHQToggleSwitch(
                     hass=hass, entry=entry, ws=ws,
                     device_id=device_id, service_id=service_id,
@@ -173,16 +170,18 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 ))
 
             elif stype == MODE_SERVICE and CMD_MODE_SET in cmds and dom in SWITCH_MODE_DOMAINS:
-                # Skip if this device already has a switch for this domain
-                dedup_key = (stype, dom)
+                # Skip only an exact tuple duplicate. A different serviceDeviceType
+                # is a separate switch.
+                sdev = str(svc.get("serviceDeviceType") or "")
+                dedup_key = (stype, dom, sdev)
                 if dedup_key in seen_switch_domains:
                     _LOGGER.debug(
-                        "[SWITCH] Skipping duplicate mode switch for device=%s domain=%s svc=%s",
-                        device_id, dom, service_id,
+                        "[SWITCH] Skipping duplicate mode switch for device=%s domain=%s serviceDeviceType=%s svc=%s",
+                        device_id, dom, sdev, service_id,
                     )
                     continue
                 seen_switch_domains.add(dedup_key)
-                label, icon = _label_for_mode_switch(dom, svc.get("serviceDeviceType") or "")
+                label, icon = _label_for_mode_switch(dom, sdev)
                 entities.append(SmartHQModeSwitch(
                     hass=hass, entry=entry, ws=ws,
                     device_id=device_id, service_id=service_id,

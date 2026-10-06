@@ -570,20 +570,23 @@ class SmartHQApi:
             if sid:
                 out[sid] = svc.get("state") or {}
         return out
+
+    @staticmethod
     def build_snapshot_index(item: dict) -> dict:
-        """Convert services array to {serviceId: state}, {(type,domain): serviceId}."""
+        """Convert services to {serviceId: state} and {(type, domain, serviceDeviceType): serviceId}."""
         services = item.get("services") or []
         svc_states: dict[str, dict] = {}
-        index: dict[tuple[str, str], str] = {}
+        index: dict[tuple[str, str, str], str] = {}
         for s in services:
             sid = str(s.get("serviceId") or "")
             stype = str(s.get("serviceType") or "")
             dtype = str(s.get("domainType") or "")
+            sdev = str(s.get("serviceDeviceType") or "")
             state = s.get("state") or {}
             if sid:
                 svc_states[sid] = state
             if stype and dtype and sid:
-                index[(stype, dtype)] = sid
+                index[(stype, dtype, sdev)] = sid
         return {"raw": item, "services": svc_states, "index": index}
 
     async def send_command(self, appliance_id: str, command: dict) -> bool:

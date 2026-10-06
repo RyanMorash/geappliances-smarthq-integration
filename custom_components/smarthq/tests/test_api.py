@@ -90,6 +90,46 @@ async def test_send_command_rejects_null_outcome() -> None:
         await api.async_send_command(**_command_kwargs())
 
 
+async def test_build_snapshot_index_keeps_distinct_service_device_types() -> None:
+    """Two services with the same type and domain stay separate when serviceDeviceType differs."""
+    item = {
+        "services": [
+            {
+                "serviceId": "svc-smoker",
+                "serviceType": "cloud.smarthq.service.toggle",
+                "domainType": "cloud.smarthq.domain.light",
+                "serviceDeviceType": "cloud.smarthq.device.smoker",
+                "state": {"on": False},
+            },
+            {
+                "serviceId": "svc-light",
+                "serviceType": "cloud.smarthq.service.toggle",
+                "domainType": "cloud.smarthq.domain.light",
+                "serviceDeviceType": "cloud.smarthq.device.light",
+                "state": {"on": True},
+            },
+        ]
+    }
+
+    index = SmartHQApi.build_snapshot_index(item)["index"]
+
+    assert index[
+        (
+            "cloud.smarthq.service.toggle",
+            "cloud.smarthq.domain.light",
+            "cloud.smarthq.device.smoker",
+        )
+    ] == "svc-smoker"
+    assert index[
+        (
+            "cloud.smarthq.service.toggle",
+            "cloud.smarthq.domain.light",
+            "cloud.smarthq.device.light",
+        )
+    ] == "svc-light"
+    assert len(index) == 2
+
+
 async def test_send_command_http_error_propagates() -> None:
     """HTTP errors from the command POST still raise SmartHQError."""
     api = _api()
