@@ -286,3 +286,204 @@ async def test_disconnect_refetches_device_snapshot() -> None:
     api.async_get_device_item.assert_awaited_once_with(device_id)
     assert store[device_id]["snapshot"]["services"]["svc-1"]["on"] is True
     mock_dispatch.assert_called_once()
+
+
+def _controllable_store(
+    *,
+    service_type: str = "cloud.smarthq.service.toggle",
+) -> tuple[str, str, dict]:
+    """Online device whose snapshot must not change until a service event."""
+    device_id = "device-abcdef12"
+    service_id = "service-abcdef12"
+    store = {
+        device_id: {
+            "presence": {"presence": "ONLINE"},
+            "snapshot": {
+                "services": {
+                    service_id: {
+                        "on": False,
+                        "mode": "cloud.smarthq.type.mode.off",
+                        "serviceType": service_type,
+                        "domainType": "cloud.smarthq.domain.light",
+                        "serviceDeviceType": "cloud.smarthq.device.light",
+                    }
+                },
+                "index": {},
+                "raw": {},
+            },
+        }
+    }
+    return device_id, service_id, store
+
+
+def _command_event(device_id: str, service_id: str, outcome: str) -> dict:
+    """pubsub#command that also carries service fields a state update might misuse."""
+    return {
+        "kind": "pubsub#command",
+        "deviceId": device_id,
+        "serviceId": service_id,
+        "serviceType": "cloud.smarthq.service.toggle",
+        "domainType": "cloud.smarthq.domain.light",
+        "serviceDeviceType": "cloud.smarthq.device.light",
+        "state": {"on": True, "mode": "cloud.smarthq.type.mode.on"},
+        "command": {"commandType": "cloud.smarthq.command.toggle.set", "on": True},
+        "correlationId": "52b52c43-35dd-4d5a-8195-2d7dc316e080",
+        "outcome": outcome,
+    }
+
+
+async def test_set_toggle_does_not_write_local_snapshot() -> None:
+    """Toggle commands wait for pubsub#service instead of writing on locally."""
+    device_id, service_id, store = _controllable_store()
+    api = MagicMock()
+    api.async_send_command = AsyncMock(
+        return_value={
+            "correlationId": "corr-toggle",
+            "outcome": "cloud.smarthq.outcome.success",
+        }
+    )
+    websocket = SmartHQWebsocket(MagicMock(), api=api, device_ids=[device_id], store=store)
+
+    await websocket.async_set_toggle(device_id, service_id, True)
+
+    service = store[device_id]["snapshot"]["services"][service_id]
+    assert service["on"] is False
+    assert service["mode"] == "cloud.smarthq.type.mode.off"
+    api.async_send_command.assert_awaited_once()
+
+
+async def test_set_mode_does_not_write_local_snapshot() -> None:
+    """Mode commands wait for pubsub#service instead of writing mode or on locally."""
+    device_id, service_id, store = _controllable_store(service_type="cloud.smarthq.service.mode")
+    api = MagicMock()
+    api.async_send_command = AsyncMock(
+        return_value={
+            "correlationId": "corr-mode",
+            "outcome": "cloud.smarthq.outcome.success",
+        }
+    )
+    websocket = SmartHQWebsocket(MagicMock(), api=api, device_ids=[device_id], store=store)
+
+    await websocket.async_set_mode(device_id, service_id, "cloud.smarthq.type.mode.on")
+
+    service = store[device_id]["snapshot"]["services"][service_id]
+    assert service["on"] is False
+    assert service["mode"] == "cloud.smarthq.type.mode.off"
+    api.async_send_command.assert_awaited_once()
+
+
+async def test_service_event_is_what_updates_toggle_state() -> None:
+    """Entity state changes when pubsub#service arrives."""
+    device_id, service_id, store = _controllable_store()
+    websocket = SmartHQWebsocket(MagicMock(), api=MagicMock(), device_ids=[device_id], store=store)
+    payload = {
+        "kind": "pubsub#service",
+        "deviceId": device_id,
+        "serviceId": service_id,
+        "serviceType": "cloud.smarthq.service.toggle",
+        "domainType": "cloud.smarthq.domain.light",
+        "state": {"on": True},
+    }
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send"):
+        await websocket._on_message(payload)
+
+    assert store[device_id]["snapshot"]["services"][service_id]["on"] is True
+
+
+async def test_command_success_does_not_change_entity_state() -> None:
+    """A success outcome waits for pubsub#service and does not refetch."""
+    device_id, service_id, store = _controllable_store()
+    api = MagicMock()
+    api.async_get_device_item = AsyncMock()
+    websocket = SmartHQWebsocket(MagicMock(), api=api, device_ids=[device_id], store=store)
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send") as mock_dispatch:
+        await websocket._on_message(
+            _command_event(device_id, service_id, "cloud.smarthq.outcome.success")
+        )
+
+    service = store[device_id]["snapshot"]["services"][service_id]
+    assert service["on"] is False
+    assert service["mode"] == "cloud.smarthq.type.mode.off"
+    api.async_get_device_item.assert_not_called()
+    mock_dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "cloud.smarthq.outcome.failed",
+        "cloud.smarthq.outcome.timeout",
+        "cloud.smarthq.outcome.unknown",
+    ],
+)
+async def test_failed_command_refetches_device_instead_of_applying_event(outcome: str) -> None:
+    """failed, timeout, and unknown outcomes reload the device and do not use the event as state."""
+    device_id, service_id, store = _controllable_store()
+    api = MagicMock()
+    api.async_get_device_item = AsyncMock(
+        return_value={
+            "services": [
+                {
+                    "serviceId": service_id,
+                    "serviceType": "cloud.smarthq.service.toggle",
+                    "domainType": "cloud.smarthq.domain.light",
+                    "serviceDeviceType": "cloud.smarthq.device.light",
+                    "state": {"on": False, "mode": "cloud.smarthq.type.mode.off"},
+                }
+            ]
+        }
+    )
+    websocket = SmartHQWebsocket(MagicMock(), api=api, device_ids=[device_id], store=store)
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send") as mock_dispatch:
+        await websocket._on_message(_command_event(device_id, service_id, outcome))
+
+    api.async_get_device_item.assert_awaited_once_with(device_id)
+    service = store[device_id]["snapshot"]["services"][service_id]
+    assert service["on"] is False
+    assert service["mode"] == "cloud.smarthq.type.mode.off"
+    mock_dispatch.assert_called_once()
+
+
+async def test_failed_command_does_not_apply_event_when_refetch_is_empty() -> None:
+    """An empty refetch leaves the previous snapshot in place."""
+    device_id, service_id, store = _controllable_store()
+    api = MagicMock()
+    api.async_get_device_item = AsyncMock(return_value={})
+    websocket = SmartHQWebsocket(MagicMock(), api=api, device_ids=[device_id], store=store)
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send") as mock_dispatch:
+        await websocket._on_message(
+            _command_event(device_id, service_id, "cloud.smarthq.outcome.failed")
+        )
+
+    service = store[device_id]["snapshot"]["services"][service_id]
+    assert service["on"] is False
+    assert service["mode"] == "cloud.smarthq.type.mode.off"
+    mock_dispatch.assert_not_called()
+
+
+async def test_other_command_outcomes_do_not_refetch_or_update_state() -> None:
+    """Outcomes outside failed/timeout/unknown still are not entity state."""
+    device_id, service_id, store = _controllable_store()
+    api = MagicMock()
+    api.async_get_device_item = AsyncMock()
+    websocket = SmartHQWebsocket(MagicMock(), api=api, device_ids=[device_id], store=store)
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send") as mock_dispatch:
+        await websocket._on_message(
+            _command_event(device_id, service_id, "cloud.smarthq.outcome.servicedisabled")
+        )
+
+    service = store[device_id]["snapshot"]["services"][service_id]
+    assert service["on"] is False
+    api.async_get_device_item.assert_not_called()
+    mock_dispatch.assert_not_called()
+
+
+async def test_smoke_level_socket_send_removed() -> None:
+    """Smoke level is not sent as service#command on the websocket."""
+    assert not hasattr(SmartHQWebsocket, "async_set_smoke_level")
+    assert not hasattr(SmartHQWebsocket, "_optimistic_toggle_update")
