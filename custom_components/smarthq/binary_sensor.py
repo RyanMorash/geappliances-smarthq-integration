@@ -499,21 +499,12 @@ class SmartHQDoorBinarySensor(BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return True when door is open."""
+        """Return True when any documented door-open flag is true."""
         st = self._get_state()
-        raw = st.get("doorState") or st.get("state") or st.get("open")
-        if raw is None:
-            # Toggle-shaped door services carry {"on": bool}. Checked last so a
-            # genuine doorState always wins: ws_client normalises `enabled` and
-            # `mode` into `on` for every service, so `on` may be present but
-            # unrelated to the door.
-            on = st.get("on")
-            if isinstance(on, bool):
-                return on
-            raw = ""
-        if isinstance(raw, bool):
-            return raw
-        return str(raw).lower() in {"open", "true", "1"}
+        for key, value in st.items():
+            if key.endswith("Open") and isinstance(value, bool) and value:
+                return True
+        return False
 
     @property
     def available(self) -> bool:
@@ -629,23 +620,15 @@ class SmartHQFilterBinarySensor(BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return True when filter replacement is needed."""
-        st = self._get_state()
-        # Common keys: filterStatus, state, replacementNeeded
-        status = str(st.get("filterStatus") or st.get("state") or "").lower()
-        if status in {"replace", "replacement_needed", "dirty", "problem", "true", "1"}:
-            return True
-        replacement = st.get("replacementNeeded")
-        if isinstance(replacement, bool):
-            return replacement
-        return False
+        """Return True when the filter is expired."""
+        return bool(self._get_state().get("expired"))
 
     @property
     def extra_state_attributes(self) -> dict:
         st = self._get_state()
         return {
-            "filter_status": st.get("filterStatus") or st.get("state"),
-            "life_remaining": st.get("lifeRemaining"),
+            "usagePercent": st.get("usagePercent"),
+            "expirationElapsedTime": st.get("expirationElapsedTime"),
         }
 
     @property
