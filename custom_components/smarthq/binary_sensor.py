@@ -285,7 +285,9 @@ async def async_setup_entry(
                         if uid not in created:
                             created.add(uid)
                             coord_entities.append(
-                                SmartHQDoorBinarySensor(hass, entry, device_id, service_id, "Door", uid)
+                                SmartHQDoorBinarySensor(
+                                    hass, entry, device_id, service_id, "Door", uid, toggle_backed=True
+                                )
                             )
                         continue
                     if CMD_TOGGLE_SET in cmds or dom != FILTER_STATUS_DOMAIN:
@@ -484,11 +486,14 @@ class SmartHQDoorBinarySensor(BinarySensorEntity):
         service_id: str,
         label: str,
         unique_id: str,
+        *,
+        toggle_backed: bool = False,
     ) -> None:
         self.hass = hass
         self._entry = entry
         self._device_id = device_id
         self._service_id = service_id
+        self._toggle_backed = toggle_backed
         self._attr_name = label
         self._attr_unique_id = unique_id
 
@@ -499,25 +504,27 @@ class SmartHQDoorBinarySensor(BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return True when door is open."""
+        """Return True when the door is open."""
         st = self._get_state()
-        raw = st.get("doorState") or st.get("state") or st.get("open")
-        if raw is None:
-            # Toggle-shaped door services carry {"on": bool}. Checked last so a
-            # genuine doorState always wins: ws_client normalises `enabled` and
-            # `mode` into `on` for every service, so `on` may be present but
-            # unrelated to the door.
+        if self._toggle_backed:
             on = st.get("on")
-            if isinstance(on, bool):
-                return on
-            raw = ""
-        if isinstance(raw, bool):
-            return raw
-        return str(raw).lower() in {"open", "true", "1"}
+            return on if isinstance(on, bool) else False
+        for key, value in st.items():
+            if key.endswith("Open") and isinstance(value, bool) and value:
+                return True
+        return False
+
+    def _has_open_flag(self, st: dict) -> bool:
+        return any(
+            key.endswith("Open") and isinstance(value, bool) for key, value in st.items()
+        )
 
     @property
     def available(self) -> bool:
-        return bool(self._get_state())
+        st = self._get_state()
+        if self._toggle_backed:
+            return isinstance(st.get("on"), bool)
+        return self._has_open_flag(st)
 
     @property
     def device_info(self):
@@ -629,28 +636,20 @@ class SmartHQFilterBinarySensor(BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return True when filter replacement is needed."""
-        st = self._get_state()
-        # Common keys: filterStatus, state, replacementNeeded
-        status = str(st.get("filterStatus") or st.get("state") or "").lower()
-        if status in {"replace", "replacement_needed", "dirty", "problem", "true", "1"}:
-            return True
-        replacement = st.get("replacementNeeded")
-        if isinstance(replacement, bool):
-            return replacement
-        return False
+        """Return True when the filter is expired."""
+        return bool(self._get_state().get("expired"))
 
     @property
     def extra_state_attributes(self) -> dict:
         st = self._get_state()
         return {
-            "filter_status": st.get("filterStatus") or st.get("state"),
-            "life_remaining": st.get("lifeRemaining"),
+            "usagePercent": st.get("usagePercent"),
+            "expirationElapsedTime": st.get("expirationElapsedTime"),
         }
 
     @property
     def available(self) -> bool:
-        return bool(self._get_state())
+        return isinstance(self._get_state().get("expired"), bool)
 
     @property
     def device_info(self):
