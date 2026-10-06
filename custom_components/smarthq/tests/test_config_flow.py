@@ -5,6 +5,7 @@ import pytest
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.smarthq.const import DOMAIN
 
@@ -18,36 +19,37 @@ def mock_setup_entry():
         yield mock_setup
 
 
-async def test_config_flow_oauth(hass: HomeAssistant, mock_setup_entry):
-    """Test the OAuth config flow."""
+async def test_config_flow_oauth(
+    hass: HomeAssistant, load_smarthq_integration, mock_setup_entry
+):
+    """OAuth flow requires Application Credentials (no placeholder client)."""
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
 
-    assert result["type"] == FlowResultType.FORM
-    assert result["step_id"] == "pick_implementation"
-
-    # This would normally continue with OAuth flow
-    # For now, we just verify the initial step works
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "missing_credentials"
 
 
-async def test_config_flow_abort_if_already_setup(hass: HomeAssistant):
+async def test_config_flow_abort_if_already_setup(
+    hass: HomeAssistant, load_smarthq_integration
+):
     """Test we abort if SmartHQ is already setup."""
-    # Create a mock config entry
-    config_entry = config_entries.ConfigEntry(
-        version=1,
-        minor_version=1,
+    MockConfigEntry(
         domain=DOMAIN,
         title="SmartHQ",
         data={},
         source=config_entries.SOURCE_USER,
         unique_id="smarthq_oauth",
-    )
-    config_entry.add_to_hass(hass)
+    ).add_to_hass(hass)
 
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
+    with patch(
+        "homeassistant.config_entries._support_single_config_entry_only",
+        return_value=True,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": config_entries.SOURCE_USER}
+        )
 
     assert result["type"] == FlowResultType.ABORT
     assert result["reason"] == "single_instance_allowed"

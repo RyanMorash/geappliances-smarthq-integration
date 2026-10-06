@@ -8,7 +8,6 @@ from typing import Any, Dict, List
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN
@@ -54,19 +53,6 @@ async def _ws_close(ws) -> None:
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the SmartHQ component."""
-    # Register OAuth2 implementation
-    config_entry_oauth2_flow.async_register_implementation(
-        hass,
-        DOMAIN,
-        config_entry_oauth2_flow.LocalOAuth2Implementation(
-            hass,
-            DOMAIN,
-            client_id="YOUR_CLIENT_ID",  # Replace with actual Client ID
-            client_secret="YOUR_CLIENT_SECRET",  # Replace with actual Client Secret
-            authorize_url="https://accounts.brillion.geappliances.com/oauth2/auth",
-            token_url="https://accounts.brillion.geappliances.com/oauth2/token",
-        ),
-    )
     return True
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
