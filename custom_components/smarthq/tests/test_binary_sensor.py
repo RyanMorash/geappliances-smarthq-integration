@@ -100,6 +100,26 @@ def test_door_unavailable_when_service_missing():
     assert entity.available is False
 
 
+def test_door_unavailable_without_open_flags():
+    """DOOR_SERVICE is unavailable when no boolean *Open field is present."""
+    assert _create_door_entity({"doorState": "open"}).available is False
+
+
+def test_door_available_when_open_flag_present():
+    """DOOR_SERVICE is available when at least one boolean *Open field exists."""
+    assert _create_door_entity({"singleOpen": False}).available is True
+
+
+def test_toggle_backed_door_available_when_on_bool():
+    """Toggle-backed door is available when on is a bool."""
+    assert _create_door_entity({"on": False}, toggle_backed=True).available is True
+
+
+def test_toggle_backed_door_unavailable_without_on():
+    """Toggle-backed door is unavailable without a boolean on field."""
+    assert _create_door_entity({}, toggle_backed=True).available is False
+
+
 def test_filter_on_when_expired():
     """Filter binary sensor is on when expired is true."""
     assert _create_filter_entity({"expired": True}).is_on is True
@@ -131,3 +151,13 @@ def test_filter_extra_state_attributes():
         "usagePercent": 42,
         "expirationElapsedTime": 86400,
     }
+
+
+def test_filter_unavailable_without_expired():
+    """Filter is unavailable when expired is missing."""
+    assert _create_filter_entity({"usagePercent": 50}).available is False
+
+
+def test_filter_available_when_expired_present():
+    """Filter is available when expired is a bool."""
+    assert _create_filter_entity({"expired": False}).available is True

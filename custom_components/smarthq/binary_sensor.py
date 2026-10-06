@@ -514,9 +514,17 @@ class SmartHQDoorBinarySensor(BinarySensorEntity):
                 return True
         return False
 
+    def _has_open_flag(self, st: dict) -> bool:
+        return any(
+            key.endswith("Open") and isinstance(value, bool) for key, value in st.items()
+        )
+
     @property
     def available(self) -> bool:
-        return bool(self._get_state())
+        st = self._get_state()
+        if self._toggle_backed:
+            return isinstance(st.get("on"), bool)
+        return self._has_open_flag(st)
 
     @property
     def device_info(self):
@@ -641,7 +649,7 @@ class SmartHQFilterBinarySensor(BinarySensorEntity):
 
     @property
     def available(self) -> bool:
-        return bool(self._get_state())
+        return isinstance(self._get_state().get("expired"), bool)
 
     @property
     def device_info(self):
