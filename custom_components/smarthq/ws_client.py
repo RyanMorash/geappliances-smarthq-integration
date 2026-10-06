@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -23,6 +24,15 @@ RESUBSCRIBE_SECONDS = 300
 TOKEN_RECONNECT_MARGIN_SECONDS = 60
 DEFAULT_TOKEN_LIFETIME_SECONDS = 3600
 KEEPALIVE_POLL_SECONDS = 5
+
+_ACCESS_TOKEN_IN_TEXT = re.compile(r"([?&]access_token=)([^&\s\"']+)", re.IGNORECASE)
+
+
+def _redact_access_token_from_text(text: str) -> str:
+    """Strip access_token query values from URLs embedded in log/notification text."""
+    if not text:
+        return text
+    return _ACCESS_TOKEN_IN_TEXT.sub(r"\1***", str(text))
 
 
 def _ws_endpoint_host_for_log(endpoint: str) -> str:
@@ -48,7 +58,11 @@ def _presence_from_payload(presence: Any) -> Dict[str, Any]:
     """Normalize websocket presence payloads for the live store."""
     if isinstance(presence, dict):
         if "presence" in presence:
-            return dict(presence)
+            result = dict(presence)
+            value = result.get("presence")
+            if isinstance(value, str):
+                result["presence"] = value.upper()
+            return result
         status = presence.get("status")
         if isinstance(status, str):
             return {"presence": status.upper()}
@@ -126,6 +140,7 @@ class SmartHQWebsocket:
         notified_failure = False
         
         while not self._stopped.is_set():
+            session_connected = False
             try:
                 endpoint = await self._api.async_get_websocket_endpoint()
                 _LOGGER.info(
@@ -134,6 +149,7 @@ class SmartHQWebsocket:
                 )
 
                 async with self._session.ws_connect(endpoint, heartbeat=None) as ws:
+                    session_connected = True
                     self._ws = ws
                     _LOGGER.info("SmartHQ WS connected")
                     if notified_failure:
@@ -154,11 +170,12 @@ class SmartHQWebsocket:
                 break
             except Exception as e:
                 consecutive_failures += 1
+                safe_error = _redact_access_token_from_text(str(e))
 
                 if consecutive_failures >= max_retries and not notified_failure:
                     error_msg = (
                         f"SmartHQ WebSocket connection failed {consecutive_failures} times.\n\n"
-                        f"Last error: {str(e)}\n\n"
+                        f"Last error: {safe_error}\n\n"
                         f"Please check:\n"
                         f"- Internet connection\n"
                         f"- SmartHQ service status\n"
@@ -171,7 +188,7 @@ class SmartHQWebsocket:
                     _LOGGER.error(
                         "SmartHQ WS: %d consecutive failures. Will keep retrying in the "
                         "background. Last error: %s",
-                        consecutive_failures, e
+                        consecutive_failures, safe_error
                     )
 
                     # Send persistent notification to Home Assistant UI (once per outage)
@@ -192,13 +209,13 @@ class SmartHQWebsocket:
 
                 _LOGGER.warning(
                     "WS error (attempt %d): %s; reconnect in %s sec",
-                    consecutive_failures, e, backoff
+                    consecutive_failures, safe_error, backoff
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
             finally:
                 self._ws = None
-                if not self._stopped.is_set():
+                if session_connected and not self._stopped.is_set():
                     await self._refetch_devices_after_disconnect()
 
     async def _token_reconnect_deadline(self) -> float:
@@ -235,6 +252,12 @@ class SmartHQWebsocket:
                 full_state["domainType"] = dtype
                 if "serviceDeviceType" in svc:
                     full_state["serviceDeviceType"] = svc["serviceDeviceType"]
+                if "label" in svc:
+                    full_state["label"] = svc["label"]
+                if "name" in svc:
+                    full_state["name"] = svc["name"]
+                if "config" in svc:
+                    full_state["config"] = svc["config"]
                 services_map[sid] = full_state
             if stype and dtype and sid:
                 index_map[(stype, dtype)] = sid
@@ -261,7 +284,7 @@ class SmartHQWebsocket:
                 _LOGGER.debug(
                     "Post-disconnect refetch failed for %s: %s",
                     device_id[:8],
-                    err,
+                    _redact_access_token_from_text(str(err)),
                 )
                 continue
             if not item:
