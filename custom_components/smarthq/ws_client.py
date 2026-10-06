@@ -122,6 +122,10 @@ class SmartHQWebsocket:
         self._task: Optional[asyncio.Task] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._stopped = asyncio.Event()
+        # Monotonic per device. Command recovery applies only if this is unchanged.
+        self._device_epochs: Dict[str, int] = {}
+        self._recovery_tasks: set[asyncio.Task] = set()
+        self._recovery_locks: Dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         """Start the WebSocket connection."""
@@ -140,6 +144,7 @@ class SmartHQWebsocket:
                 await self._ws.close()
         if self._session:
             await self._session.close()
+        self._cancel_command_recoveries()
 
     async def _runner(self) -> None:
         """Main WebSocket connection loop with reconnection logic."""
@@ -227,6 +232,7 @@ class SmartHQWebsocket:
                 backoff = min(backoff * 2, 60)
             finally:
                 self._ws = None
+                self._cancel_command_recoveries()
                 if session_connected and not self._stopped.is_set():
                     await self._refetch_devices_after_disconnect()
 
@@ -287,8 +293,56 @@ class SmartHQWebsocket:
                 "deviceType": item.get("deviceType"),
             }
 
-    async def _refetch_device_snapshot(self, device_id: str, *, failure_log: str) -> None:
+    def _advance_device_epoch(self, device_id: str) -> int:
+        """Mark a newer snapshot for this device so older REST recovery is dropped."""
+        epoch = self._device_epochs.get(device_id, 0) + 1
+        self._device_epochs[device_id] = epoch
+        return epoch
+
+    def _schedule_command_recovery(self, device_id: str) -> None:
+        """Refetch one device without blocking the websocket reader."""
+        epoch = self._advance_device_epoch(device_id)
+        task = asyncio.create_task(
+            self._run_command_recovery(device_id, epoch),
+            name=f"smarthq_command_recovery_{device_id[:8]}",
+        )
+        self._recovery_tasks.add(task)
+        task.add_done_callback(self._recovery_task_done)
+
+    def _recovery_task_done(self, task: asyncio.Task) -> None:
+        self._recovery_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error:
+            _LOGGER.debug("Command recovery task failed: %s", error)
+
+    def _cancel_command_recoveries(self) -> None:
+        for task in list(self._recovery_tasks):
+            task.cancel()
+
+    async def _run_command_recovery(self, device_id: str, epoch: int) -> None:
+        """Run one command-failure refetch. A newer epoch for this device wins."""
+        lock = self._recovery_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            if self._device_epochs.get(device_id) != epoch:
+                return
+            await self._refetch_device_snapshot(
+                device_id,
+                failure_log="Command outcome refetch failed for %s: %s",
+                epoch=epoch,
+            )
+
+    async def _refetch_device_snapshot(
+        self,
+        device_id: str,
+        *,
+        failure_log: str,
+        epoch: int | None = None,
+    ) -> None:
         """Load one device over REST and notify entities. The command event is not state."""
+        if epoch is not None and self._device_epochs.get(device_id) != epoch:
+            return
         try:
             item = await self._api.async_get_device_item(device_id)
         except Exception as err:
@@ -296,6 +350,12 @@ class SmartHQWebsocket:
                 failure_log,
                 device_id[:8],
                 _redact_access_token_from_text(str(err)),
+            )
+            return
+        if epoch is not None and self._device_epochs.get(device_id) != epoch:
+            _LOGGER.debug(
+                "Skipping stale command recovery for %s",
+                device_id[:8],
             )
             return
         if not item:
@@ -1458,10 +1518,7 @@ class SmartHQWebsocket:
                         correlation_label,
                     )
                 if did:
-                    await self._refetch_device_snapshot(
-                        did,
-                        failure_log="Command outcome refetch failed for %s: %s",
-                    )
+                    self._schedule_command_recovery(did)
             else:
                 _LOGGER.info(
                     "[COMMAND_OUTCOME] Command completed: %s (correlation=%s)",
@@ -1593,6 +1650,8 @@ class SmartHQWebsocket:
 
         # Update store and send signal
         if changed and did:
+            # A service event is newer than any command-failure REST snapshot still in flight.
+            self._advance_device_epoch(did)
             dev = self._store.setdefault(did, {})
             snap = dev.setdefault("snapshot", {"raw": {}, "services": {}, "index": {}})
             

@@ -77,6 +77,19 @@ async def test_send_command_rejects_non_success_outcome(outcome: str) -> None:
         await api.async_send_command(**_command_kwargs())
 
 
+async def test_send_command_rejects_null_outcome() -> None:
+    """A present null outcome is not a missing key and is not success."""
+    api = _api()
+    api._request_json.return_value = {
+        "success": True,
+        "correlationId": "corr-null",
+        "outcome": None,
+    }
+
+    with pytest.raises(SmartHQError, match=r"None.*corr-null"):
+        await api.async_send_command(**_command_kwargs())
+
+
 async def test_send_command_http_error_propagates() -> None:
     """HTTP errors from the command POST still raise SmartHQError."""
     api = _api()

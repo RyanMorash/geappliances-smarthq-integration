@@ -121,8 +121,9 @@ class SmartHQApi:
             Response body. correlationId is preserved when the command is accepted.
 
         Raises:
-            SmartHQError: HTTP failure, or a body whose outcome is present and is not
-                cloud.smarthq.outcome.success. A 2xx acknowledgement is not appliance state.
+            SmartHQError: HTTP failure, or a body that includes outcome and the value
+                is not cloud.smarthq.outcome.success. Null counts as present. Only a
+                missing outcome key is accepted without that check.
         """
         url = f"{self._base_url}/v2/command"
         
@@ -149,9 +150,9 @@ class SmartHQApi:
             _LOGGER.error("[REST_CMD] ✗ Command failed: %s", e)
             raise
 
-        if isinstance(result, dict):
-            outcome = result.get("outcome")
-            if outcome is not None and outcome != COMMAND_OUTCOME_SUCCESS:
+        if isinstance(result, dict) and "outcome" in result:
+            outcome = result["outcome"]
+            if outcome != COMMAND_OUTCOME_SUCCESS:
                 correlation_id = result.get("correlationId")
                 message = f"Command outcome {outcome}"
                 if correlation_id:

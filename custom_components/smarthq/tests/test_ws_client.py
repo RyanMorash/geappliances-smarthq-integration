@@ -1,5 +1,6 @@
 """Tests for SmartHQ WebSocket state handling."""
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -316,6 +317,13 @@ def _controllable_store(
     return device_id, service_id, store
 
 
+async def _wait_for_command_recoveries(websocket: SmartHQWebsocket) -> None:
+    """Let scheduled command-failure refetches finish."""
+    tasks = list(websocket._recovery_tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
 def _command_event(device_id: str, service_id: str, outcome: str) -> dict:
     """pubsub#command that also carries service fields a state update might misuse."""
     return {
@@ -439,6 +447,7 @@ async def test_failed_command_refetches_device_instead_of_applying_event(outcome
 
     with patch("custom_components.smarthq.ws_client.async_dispatcher_send") as mock_dispatch:
         await websocket._on_message(_command_event(device_id, service_id, outcome))
+        await _wait_for_command_recoveries(websocket)
 
     api.async_get_device_item.assert_awaited_once_with(device_id)
     service = store[device_id]["snapshot"]["services"][service_id]
@@ -458,6 +467,7 @@ async def test_failed_command_does_not_apply_event_when_refetch_is_empty() -> No
         await websocket._on_message(
             _command_event(device_id, service_id, "cloud.smarthq.outcome.failed")
         )
+        await _wait_for_command_recoveries(websocket)
 
     service = store[device_id]["snapshot"]["services"][service_id]
     assert service["on"] is False
@@ -481,6 +491,153 @@ async def test_other_command_outcomes_do_not_refetch_or_update_state() -> None:
     assert service["on"] is False
     api.async_get_device_item.assert_not_called()
     mock_dispatch.assert_not_called()
+
+
+def _device_item(service_id: str, *, on: bool) -> dict:
+    return {
+        "services": [
+            {
+                "serviceId": service_id,
+                "serviceType": "cloud.smarthq.service.toggle",
+                "domainType": "cloud.smarthq.domain.light",
+                "serviceDeviceType": "cloud.smarthq.device.light",
+                "state": {"on": on},
+            }
+        ]
+    }
+
+
+async def test_command_recovery_does_not_block_other_device_events() -> None:
+    """A slow refetch for one device does not hold up another device's service event."""
+    device_a, service_a, store = _controllable_store()
+    device_b = "device-b-123456"
+    service_b = "service-b-123456"
+    store[device_b] = {
+        "presence": {"presence": "ONLINE"},
+        "snapshot": {
+            "services": {
+                service_b: {
+                    "on": False,
+                    "serviceType": "cloud.smarthq.service.toggle",
+                    "domainType": "cloud.smarthq.domain.light",
+                    "serviceDeviceType": "cloud.smarthq.device.light",
+                }
+            },
+            "index": {},
+            "raw": {},
+        },
+    }
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_get(_device_id: str) -> dict:
+        started.set()
+        await release.wait()
+        return _device_item(service_a, on=False)
+
+    api = MagicMock()
+    api.async_get_device_item = AsyncMock(side_effect=slow_get)
+    websocket = SmartHQWebsocket(
+        MagicMock(),
+        api=api,
+        device_ids=[device_a, device_b],
+        store=store,
+    )
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send"):
+        await websocket._on_message(
+            _command_event(device_a, service_a, "cloud.smarthq.outcome.timeout")
+        )
+        await started.wait()
+        await websocket._on_message(
+            {
+                "kind": "pubsub#service",
+                "deviceId": device_b,
+                "serviceId": service_b,
+                "serviceType": "cloud.smarthq.service.toggle",
+                "domainType": "cloud.smarthq.domain.light",
+                "state": {"on": True},
+            }
+        )
+        assert store[device_b]["snapshot"]["services"][service_b]["on"] is True
+        assert store[device_a]["snapshot"]["services"][service_a]["on"] is False
+        release.set()
+        await _wait_for_command_recoveries(websocket)
+
+    assert store[device_b]["snapshot"]["services"][service_b]["on"] is True
+
+
+async def test_late_command_recovery_does_not_overwrite_newer_service_event() -> None:
+    """REST recovery started before a service event must not replace that event."""
+    device_id, service_id, store = _controllable_store()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_get(_device_id: str) -> dict:
+        started.set()
+        await release.wait()
+        return _device_item(service_id, on=False)
+
+    api = MagicMock()
+    api.async_get_device_item = AsyncMock(side_effect=slow_get)
+    websocket = SmartHQWebsocket(MagicMock(), api=api, device_ids=[device_id], store=store)
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send"):
+        await websocket._on_message(
+            _command_event(device_id, service_id, "cloud.smarthq.outcome.failed")
+        )
+        await started.wait()
+        await websocket._on_message(
+            {
+                "kind": "pubsub#service",
+                "deviceId": device_id,
+                "serviceId": service_id,
+                "serviceType": "cloud.smarthq.service.toggle",
+                "domainType": "cloud.smarthq.domain.light",
+                "state": {"on": True},
+            }
+        )
+        release.set()
+        await _wait_for_command_recoveries(websocket)
+
+    assert store[device_id]["snapshot"]["services"][service_id]["on"] is True
+    api.async_get_device_item.assert_awaited_once()
+
+
+async def test_older_command_recovery_does_not_overwrite_newer_one() -> None:
+    """Per-device recovery keeps the later REST snapshot when the first returns late."""
+    device_id, service_id, store = _controllable_store()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    async def get_item(_device_id: str) -> dict:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+            return _device_item(service_id, on=False)
+        return _device_item(service_id, on=True)
+
+    api = MagicMock()
+    api.async_get_device_item = AsyncMock(side_effect=get_item)
+    websocket = SmartHQWebsocket(MagicMock(), api=api, device_ids=[device_id], store=store)
+
+    with patch("custom_components.smarthq.ws_client.async_dispatcher_send"):
+        await websocket._on_message(
+            _command_event(device_id, service_id, "cloud.smarthq.outcome.unknown")
+        )
+        await first_started.wait()
+        await websocket._on_message(
+            _command_event(device_id, service_id, "cloud.smarthq.outcome.failed")
+        )
+        tasks = list(websocket._recovery_tasks)
+        release_first.set()
+        await asyncio.gather(*tasks)
+
+    assert store[device_id]["snapshot"]["services"][service_id]["on"] is True
+    assert calls == 2
 
 
 async def test_smoke_level_socket_send_removed() -> None:
