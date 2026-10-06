@@ -4,7 +4,11 @@ from unittest.mock import MagicMock
 
 from custom_components.smarthq.binary_sensor import (
     SmartHQDoorBinarySensor,
+<<<<<<< HEAD
     SmartHQFilterBinarySensor,
+=======
+    SmartHQNotificationRuleBinarySensor,
+>>>>>>> 9594867 (Expose notification rules as read-only binary sensors)
 )
 from custom_components.smarthq.const import DOMAIN
 
@@ -100,6 +104,7 @@ def test_door_unavailable_when_service_missing():
     assert entity.available is False
 
 
+<<<<<<< HEAD
 def test_door_unavailable_without_open_flags():
     """DOOR_SERVICE is unavailable when no boolean *Open field is present."""
     assert _create_door_entity({"doorState": "open"}).available is False
@@ -161,3 +166,60 @@ def test_filter_unavailable_without_expired():
 def test_filter_available_when_expired_present():
     """Filter is available when expired is a bool."""
     assert _create_filter_entity({"expired": False}).available is True
+=======
+RULE_ID = "door-alert-rule"
+
+
+def _create_notification_rule_entity(
+    settings: list,
+    initial_value: bool = False,
+) -> SmartHQNotificationRuleBinarySensor:
+    hass = MagicMock()
+    hass.data = {
+        DOMAIN: {
+            "test-entry": {
+                "store": {
+                    DEVICE_ID: {
+                        "settings": settings,
+                    }
+                }
+            }
+        }
+    }
+    entry = MagicMock()
+    entry.entry_id = "test-entry"
+    return SmartHQNotificationRuleBinarySensor(
+        hass,
+        entry,
+        DEVICE_ID,
+        RULE_ID,
+        "Smoker",
+        "Door Alert",
+        "Notify when door opens",
+        initial_value,
+        "test-notification-rule-uid",
+    )
+
+
+def test_notification_rule_on_from_store_current():
+    """BOOLEAN rule with current=True reports is_on."""
+    entity = _create_notification_rule_entity(
+        [{"id": RULE_ID, "type": "BOOLEAN", "current": True}],
+    )
+    assert entity.is_on is True
+
+
+def test_notification_rule_off_from_store_current():
+    """BOOLEAN rule with current=False reports off."""
+    entity = _create_notification_rule_entity(
+        [{"id": RULE_ID, "type": "BOOLEAN", "current": False}],
+        initial_value=True,
+    )
+    assert entity.is_on is False
+
+
+def test_notification_rule_falls_back_to_initial_value():
+    """When the rule is missing from the store, use the value from setup."""
+    entity = _create_notification_rule_entity([], initial_value=True)
+    assert entity.is_on is True
+>>>>>>> 9594867 (Expose notification rules as read-only binary sensors)

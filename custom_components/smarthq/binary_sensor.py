@@ -13,7 +13,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.entity import EntityCategory
 
-from .const import DOMAIN
+from .const import DOMAIN, DEFAULT_NAME
 from .dispatcher import SIGNAL_DEVICE_UPDATED
 from .service_registry import (
     FIRMWARE_SERVICE,
@@ -388,6 +388,42 @@ async def async_setup_entry(
                     coord_entities.extend(_build_standard_binary_sensors(
                         hass, entry, device_id, service_id, stype, created,
                     ))
+
+            # BOOLEAN notification rules (REST settings; Digital Twin API is GET-only)
+            settings_list = device_item.get("settings") or []
+            info = device_item.get("info") or {}
+            dev_name = info.get("nickname") or info.get("name") or DEFAULT_NAME
+            for setting in settings_list:
+                if not isinstance(setting, dict):
+                    continue
+                if setting.get("type") != "BOOLEAN":
+                    continue
+                rule_id = setting.get("id") or ""
+                if not rule_id:
+                    continue
+                title = setting.get("title") or setting.get("name") or rule_id
+                if dev_name and title.lower().startswith(dev_name.lower() + " "):
+                    title = title[len(dev_name) + 1 :]
+                if title == title.upper():
+                    title = title.title()
+                description = setting.get("description") or ""
+                uid = make_unique_id(device_id, rule_id, "notification_rule")
+                if uid in created:
+                    continue
+                created.add(uid)
+                coord_entities.append(
+                    SmartHQNotificationRuleBinarySensor(
+                        hass,
+                        entry,
+                        device_id,
+                        rule_id,
+                        dev_name,
+                        title,
+                        description,
+                        bool(setting.get("current", False)),
+                        uid,
+                    )
+                )
 
         if coord_entities:
             async_add_entities(coord_entities, update_before_add=True)
@@ -1017,6 +1053,110 @@ class SmartHQCoffeeBrewerStatusBinarySensor(BinarySensorEntity):
     @property
     def available(self) -> bool:
         return self._state_key in self._get_state()
+
+    @property
+    def device_info(self):
+        return _device_info_for(self.hass, self._entry, self._device_id)
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                SIGNAL_DEVICE_UPDATED.format(device_id=self._device_id),
+                self._signal_update,
+            )
+        )
+        self.async_write_ha_state()
+
+    @callback
+    def _signal_update(self) -> None:
+        self.async_write_ha_state()
+
+
+def _icon_for_notification_rule(title: str) -> str:
+    """Pick an MDI icon based on alert/notification title keywords."""
+    t = title.lower()
+    if "door" in t:
+        return "mdi:door-alert"
+    if "smoke" in t or "clear" in t:
+        return "mdi:smoke-detector"
+    if "preheat" in t:
+        return "mdi:thermometer-alert"
+    if "finish" in t or "complete" in t or "cycle" in t:
+        return "mdi:check-circle-outline"
+    if "early" in t or "reminder" in t:
+        return "mdi:bell-ring-outline"
+    if "warm" in t:
+        return "mdi:fire-alert"
+    if "start" in t:
+        return "mdi:play-circle-outline"
+    if "software" in t or "update" in t:
+        return "mdi:update"
+    if "lint" in t or "filter" in t or "mesh" in t:
+        return "mdi:air-filter"
+    if "balance" in t:
+        return "mdi:scale-unbalanced"
+    if "unattended" in t or "clothes" in t:
+        return "mdi:tshirt-crew-outline"
+    if "dispense" in t or "refill" in t:
+        return "mdi:cup-water"
+    if "delay" in t:
+        return "mdi:timer-outline"
+    if "wash" in t:
+        return "mdi:washing-machine"
+    if "self clean" in t or "clean" in t:
+        return "mdi:auto-fix"
+    return "mdi:bell-outline"
+
+
+class SmartHQNotificationRuleBinarySensor(BinarySensorEntity):
+    """Read-only binary sensor for a BOOLEAN notification rule (device#setting).
+
+    State is read from store[device_id]['settings'] (normalized ``current`` from
+    ruleEnabled) and refreshed by the settings poll task in __init__.py.
+    """
+
+    _attr_should_poll = False
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        device_id: str,
+        rule_id: str,
+        dev_name: str,
+        title: str,
+        description: str,
+        initial_value: bool,
+        unique_id: str,
+    ) -> None:
+        self.hass = hass
+        self._entry = entry
+        self._device_id = device_id
+        self._rule_id = rule_id
+        self._attr_name = f"{dev_name} {title}"
+        self._attr_unique_id = unique_id
+        self._attr_icon = _icon_for_notification_rule(title)
+        self._attr_extra_state_attributes = {"description": description} if description else {}
+        self._current: bool = initial_value
+
+    def _get_current_from_store(self) -> bool | None:
+        settings = (_store(self.hass, self._entry).get(self._device_id) or {}).get("settings") or []
+        for s in settings:
+            if isinstance(s, dict) and s.get("id") == self._rule_id:
+                return bool(s.get("current", self._current))
+        return None
+
+    @property
+    def is_on(self) -> bool:
+        v = self._get_current_from_store()
+        return v if v is not None else self._current
+
+    @property
+    def available(self) -> bool:
+        return True
 
     @property
     def device_info(self):

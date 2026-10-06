@@ -1,14 +1,14 @@
 """Switch platform for SmartHQ integration.
 
 Entity registration is driven by:
-  1. coordinator.data[device_id]["item"]["services"]  (WS-based service switches)
-  2. coordinator.data[device_id]["settings"]           (REST-based notification/alert toggles)
+  coordinator.data[device_id]["item"]["services"]  (WS-based service switches)
 
 Service → entity mapping (via SERVICE_MAPPING allowlist):
   toggle              + CMD_TOGGLE_SET                               → SmartHQToggleSwitch
   mode                + CMD_MODE_SET + domain in SWITCH_MODE_DOMAINS → SmartHQModeSwitch
   laundry.toggle.v2   + CMD_LAUNDRY_TOGGLE_V2_SET                   → SmartHQLaundryToggleSwitch
-  settings (type=BOOLEAN)                                            → SmartHQSettingSwitch
+
+BOOLEAN notification rules are exposed as read-only binary sensors in binary_sensor.py.
 
 ServiceTypes NOT in SERVICE_MAPPING are silently ignored (allowlist approach).
 """
@@ -21,7 +21,6 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, MANUFACTURER, DEFAULT_NAME, sdev_prefix
@@ -200,37 +199,6 @@ async def async_setup_entry(hass, entry, async_add_entities):
                     unique_id=make_unique_id(device_id, service_id, "laundry_toggle_v2"),
                 ))
 
-        # ── Settings-based BOOLEAN notification/alert switches ──────────
-        settings_list = device_item.get("settings") or []
-        api = bucket.get("api")
-        # coordinator.data[did]["info"] is set directly by coordinator._async_update_data
-        info = device_item.get("info") or {}
-        dev_name = info.get("nickname") or info.get("name") or DEFAULT_NAME
-        for setting in settings_list:
-            if not isinstance(setting, dict):
-                continue
-            if setting.get("type") != "BOOLEAN":
-                continue
-            rule_id = setting.get("id") or ""
-            if not rule_id:
-                continue
-            title = setting.get("title") or setting.get("name") or rule_id
-            # Strip device name prefix from title to avoid "Smoker Smoker Door Alert"
-            if dev_name and title.lower().startswith(dev_name.lower() + " "):
-                title = title[len(dev_name) + 1:]
-            # Normalise all-caps titles like "BREW CYCLE STATUS" → "Brew Cycle Status"
-            if title == title.upper():
-                title = title.title()
-            description = setting.get("description") or ""
-            uid = make_unique_id(device_id, rule_id, "setting")
-            entities.append(SmartHQSettingSwitch(
-                hass=hass, entry=entry, api=api,
-                device_id=device_id, rule_id=rule_id,
-                dev_name=dev_name, title=title, description=description,
-                initial_value=bool(setting.get("current", False)),
-                unique_id=uid,
-            ))
-
     _LOGGER.info("[SWITCH] Registering %d switch entities", len(entities))
     if entities:
         async_add_entities(entities, update_before_add=False)
@@ -407,147 +375,3 @@ class SmartHQLaundryToggleSwitch(_SmartHQSwitchBase):
             device_id=self._device_id, service_id=self._service_id, on=False
         )
         self.async_write_ha_state()
-
-
-# ---------------------------------------------------------------------------
-# Settings-based BOOLEAN switch (notification / alert toggles)
-# ---------------------------------------------------------------------------
-
-def _icon_for_setting(title: str) -> str:
-    """Pick an MDI icon based on alert/notification title keywords."""
-    t = title.lower()
-    if "door" in t:
-        return "mdi:door-alert"
-    if "smoke" in t or "clear" in t:
-        return "mdi:smoke-detector"
-    if "preheat" in t:
-        return "mdi:thermometer-alert"
-    if "finish" in t or "complete" in t or "cycle" in t:
-        return "mdi:check-circle-outline"
-    if "early" in t or "reminder" in t:
-        return "mdi:bell-ring-outline"
-    if "warm" in t:
-        return "mdi:fire-alert"
-    if "start" in t:
-        return "mdi:play-circle-outline"
-    if "software" in t or "update" in t:
-        return "mdi:update"
-    if "lint" in t or "filter" in t or "mesh" in t:
-        return "mdi:air-filter"
-    if "balance" in t:
-        return "mdi:scale-unbalanced"
-    if "unattended" in t or "clothes" in t:
-        return "mdi:tshirt-crew-outline"
-    if "dispense" in t or "refill" in t:
-        return "mdi:cup-water"
-    if "delay" in t:
-        return "mdi:timer-outline"
-    if "wash" in t:
-        return "mdi:washing-machine"
-    if "self clean" in t or "clean" in t:
-        return "mdi:auto-fix"
-    return "mdi:bell-outline"
-
-
-class SmartHQSettingSwitch(SwitchEntity):
-    """Switch entity backed by a REST settings BOOLEAN rule.
-
-    State is read from store[device_id]['settings'] (refreshed every 30 s by
-    the _poll_settings task in __init__.py).  Writes go straight to the
-    SmartHQ REST API via api.async_set_setting().
-    """
-
-    _attr_should_poll = False
-    _attr_has_entity_name = True
-
-    def __init__(
-        self, hass, entry, api,
-        device_id: str, rule_id: str,
-        dev_name: str, title: str, description: str,
-        initial_value: bool, unique_id: str,
-    ):
-        self.hass = hass
-        self._entry = entry
-        self._api = api
-        self._device_id = device_id
-        self._rule_id = rule_id
-        self._title = title
-        self._attr_name = f"{dev_name} {title}"
-        self._attr_unique_id = unique_id
-        self._attr_icon = _icon_for_setting(title)
-        self._attr_entity_category = EntityCategory.CONFIG  # shown under Configuration, not Controls
-        self._attr_extra_state_attributes = {"description": description} if description else {}
-        self._current: bool = initial_value
-
-    # ------------------------------------------------------------------
-    # State helpers
-    # ------------------------------------------------------------------
-
-    def _get_current_from_store(self) -> bool | None:
-        """Return the latest value from the settings list in the store."""
-        store = _store(self.hass, self._entry)
-        settings = (store.get(self._device_id) or {}).get("settings") or []
-        for s in settings:
-            if isinstance(s, dict) and s.get("id") == self._rule_id:
-                return bool(s.get("current", self._current))
-        return None
-
-    @property
-    def is_on(self) -> bool:
-        v = self._get_current_from_store()
-        return v if v is not None else self._current
-
-    @property
-    def available(self) -> bool:
-        return True  # Settings are always reachable via REST
-
-    @property
-    def device_info(self):
-        return _device_info_for(self.hass, self._entry, self._device_id)
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    async def async_added_to_hass(self):
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                SIGNAL_DEVICE_UPDATED.format(device_id=self._device_id),
-                self._signal_update,
-            )
-        )
-
-    @callback
-    def _signal_update(self):
-        self.async_write_ha_state()
-
-    # ------------------------------------------------------------------
-    # Commands
-    # ------------------------------------------------------------------
-
-    async def async_turn_on(self, **kwargs):
-        _LOGGER.info("[SETTING_SW] ON: %s (rule=%s)", self._title, self._rule_id)
-        ok = await self._api.async_set_setting(self._device_id, self._rule_id, True)
-        if ok:
-            self._current = True
-            # Optimistically update the store so the next poll sees the new value
-            self._update_store(True)
-            self.async_write_ha_state()
-
-    async def async_turn_off(self, **kwargs):
-        _LOGGER.info("[SETTING_SW] OFF: %s (rule=%s)", self._title, self._rule_id)
-        ok = await self._api.async_set_setting(self._device_id, self._rule_id, False)
-        if ok:
-            self._current = False
-            self._update_store(False)
-            self.async_write_ha_state()
-
-    def _update_store(self, value: bool) -> None:
-        """Optimistically update the settings list in the store."""
-        store = _store(self.hass, self._entry)
-        settings = (store.get(self._device_id) or {}).get("settings") or []
-        for s in settings:
-            if isinstance(s, dict) and s.get("id") == self._rule_id:
-                s["current"] = value
-                return
